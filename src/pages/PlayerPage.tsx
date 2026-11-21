@@ -9,6 +9,8 @@ import {
   MessageSquareText,
   Mic2,
   Minimize2,
+  Monitor,
+  MonitorOff,
   Pause,
   Pencil,
   Play,
@@ -51,8 +53,10 @@ export const PlayerPage: React.FC = () => {
     showLyricsInPlayer,
     setShowLyricsInPlayer,
     isFullscreen,
+    isBrowserFullscreen,
     toggleFullscreen,
     exitFullscreen,
+    toggleBrowserFullscreen,
     setIsQueueOpen,
     setActivePage,
     activePalette,
@@ -478,12 +482,43 @@ export const PlayerPage: React.FC = () => {
         </div>
       )}
 
+      {/* Homepage Browser-Level Fullscreen Control (hides browser tabs/URL bar while preserving full webpage & feature fullscreen) */}
+      <div className="absolute top-3 right-4 sm:right-6 z-20 flex items-center gap-2">
+        <button
+          type="button"
+          onClick={toggleBrowserFullscreen}
+          title={
+            isBrowserFullscreen
+              ? '退出浏览器全屏（恢复浏览器顶部标签与地址栏）'
+              : '浏览器全屏显示：隐藏浏览器顶部标签与地址栏，保留网页与全屏展示入口'
+          }
+          aria-label={isBrowserFullscreen ? '退出浏览器全屏' : '浏览器全屏显示'}
+          className={`min-h-[38px] px-3 py-1.5 rounded-xl backdrop-blur-xl border text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer shadow-lg ${
+            isBrowserFullscreen
+              ? 'bg-rose-500/20 hover:bg-rose-500/30 border-rose-400/35 text-rose-100'
+              : 'bg-white/[0.07] hover:bg-white/[0.14] border-white/12 text-white/80 hover:text-white'
+          }`}
+        >
+          {isBrowserFullscreen ? (
+            <>
+              <MonitorOff className="w-3.5 h-3.5 text-rose-300 shrink-0" />
+              <span>退出浏览器全屏</span>
+            </>
+          ) : (
+            <>
+              <Monitor className="w-3.5 h-3.5 shrink-0" />
+              <span>浏览器全屏</span>
+            </>
+          )}
+        </button>
+      </div>
+
       {/* Main dual-column workspace */}
       <div
         className={`relative z-10 flex-1 min-h-0 w-full mx-auto grid items-center ${
           showLyricsInPlayer
-            ? 'px-4 sm:px-6 lg:px-10 pt-3 sm:pt-5 pb-20 sm:pb-24 grid-cols-1 md:grid-cols-12 gap-6 lg:gap-10'
-            : 'max-w-2xl px-4 sm:px-6 lg:px-10 pt-3 sm:pt-5 pb-20 sm:pb-24 grid-cols-1 gap-6 lg:gap-10'
+            ? 'px-4 sm:px-6 lg:px-10 pt-11 sm:pt-12 pb-20 sm:pb-24 grid-cols-1 md:grid-cols-12 gap-6 lg:gap-10'
+            : 'max-w-2xl px-4 sm:px-6 lg:px-10 pt-11 sm:pt-12 pb-20 sm:pb-24 grid-cols-1 gap-6 lg:gap-10'
         }`}
       >
         {/* Left Column: Vinyl Stage + Track Info + Transport Controls */}
@@ -969,7 +1004,7 @@ export const PlayerPage: React.FC = () => {
 
         {/* Right Column: Glassmorphic Real-Time Synced Lyrics Panel */}
         {showLyricsInPlayer && (
-          <section className="md:col-span-6 lg:col-span-7 min-h-0 flex flex-col backdrop-blur-2xl transition-all duration-500 rounded-3xl bg-white/[0.045] border border-white/10 p-5 sm:p-7 shadow-[0_24px_70px_rgba(0,0,0,0.45)] h-[320px] md:h-[calc(100dvh-140px)] max-h-[680px]">
+          <section className="md:col-span-6 lg:col-span-7 min-h-0 flex flex-col backdrop-blur-2xl transition-all duration-500 rounded-3xl bg-white/[0.045] border border-white/10 p-5 sm:p-7 shadow-[0_24px_70px_rgba(0,0,0,0.45)] h-[320px] md:h-[calc(100dvh-160px)] max-h-[680px]">
             <LyricsView
               lyricsRaw={currentTrack?.lyricsRaw}
               currentTime={currentTime}

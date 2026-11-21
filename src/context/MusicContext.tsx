@@ -137,8 +137,12 @@ interface MusicContextValue {
   showLyricsInPlayer: boolean;
   setShowLyricsInPlayer: (show: boolean) => void;
   isFullscreen: boolean;
+  isBrowserFullscreen: boolean;
   toggleFullscreen: () => Promise<void>;
   exitFullscreen: () => Promise<void>;
+  enterBrowserFullscreen: () => Promise<void>;
+  exitBrowserFullscreen: () => Promise<void>;
+  toggleBrowserFullscreen: () => Promise<void>;
   audioSettings: AudioDspSettings;
   personalization: PersonalizationSettings;
   activePalette: TrackColorPalette;
@@ -270,6 +274,8 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
   const [isQueueOpen, setIsQueueOpen] = useState(false);
   const [showLyricsInPlayer, setShowLyricsInPlayer] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isBrowserFullscreen, setIsBrowserFullscreen] = useState(false);
+  const explicitBrowserFsRef = useRef(false);
 
   const [audioSettings, setAudioSettings] = useState<AudioDspSettings>(
     DEFAULT_AUDIO_SETTINGS
@@ -1975,14 +1981,16 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     [showToast, updateAudioSettings]
   );
 
-  // Sync native Fullscreen API & Escape key with immersive fullscreen mode
+  // Sync native Fullscreen API & Escape key cleanly while keeping Browser Fullscreen decoupled from Feature Fullscreen
   useEffect(() => {
-    const onFullscreenChange = () => {
+    const syncNativeState = () => {
       const doc = document as Document & { webkitFullscreenElement?: Element | null };
       const nativeActive = Boolean(
         document.fullscreenElement || doc.webkitFullscreenElement
       );
+      setIsBrowserFullscreen(nativeActive);
       if (!nativeActive) {
+        explicitBrowserFsRef.current = false;
         setIsFullscreen(false);
       }
     };
@@ -1993,18 +2001,79 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       }
     };
 
-    document.addEventListener('fullscreenchange', onFullscreenChange);
-    document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+    syncNativeState();
+    document.addEventListener('fullscreenchange', syncNativeState);
+    document.addEventListener('webkitfullscreenchange', syncNativeState);
     window.addEventListener('keydown', onKeyDown);
     return () => {
-      document.removeEventListener('fullscreenchange', onFullscreenChange);
-      document.removeEventListener('webkitfullscreenchange', onFullscreenChange);
+      document.removeEventListener('fullscreenchange', syncNativeState);
+      document.removeEventListener('webkitfullscreenchange', syncNativeState);
       window.removeEventListener('keydown', onKeyDown);
     };
   }, [isFullscreen]);
 
+  const enterBrowserFullscreen = useCallback(async () => {
+    explicitBrowserFsRef.current = true;
+    const doc = document as Document & { webkitFullscreenElement?: Element | null };
+    if (document.fullscreenElement || doc.webkitFullscreenElement) {
+      setIsBrowserFullscreen(true);
+      showToast('已处于浏览器全屏（顶部标签已隐藏，仍可进入全屏展示）');
+      return;
+    }
+    try {
+      const el = document.documentElement as HTMLElement & {
+        webkitRequestFullscreen?: () => Promise<void> | void;
+      };
+      if (el.requestFullscreen) {
+        await el.requestFullscreen();
+      } else if (el.webkitRequestFullscreen) {
+        await el.webkitRequestFullscreen();
+      } else {
+        explicitBrowserFsRef.current = false;
+        showToast('当前浏览器不支持网页主动全屏，请使用浏览器菜单或 F11 全屏');
+        return;
+      }
+      setIsBrowserFullscreen(true);
+      showToast('已隐藏顶部标签进入浏览器全屏（左下角可随时退出）');
+    } catch {
+      explicitBrowserFsRef.current = false;
+      showToast('当前环境受限无法自动全屏，请在新标签页打开后重试（桌面端可按 F11）');
+    }
+  }, [showToast]);
+
+  const exitBrowserFullscreen = useCallback(async () => {
+    explicitBrowserFsRef.current = false;
+    setIsBrowserFullscreen(false);
+    try {
+      const doc = document as Document & {
+        webkitFullscreenElement?: Element | null;
+        webkitExitFullscreen?: () => Promise<void> | void;
+      };
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else if (doc.webkitFullscreenElement && doc.webkitExitFullscreen) {
+        await doc.webkitExitFullscreen();
+      }
+      showToast('已退出浏览器全屏，顶部标签已恢复');
+    } catch {
+      // Ignore native exit errors if browser already exited
+    }
+  }, [showToast]);
+
+  const toggleBrowserFullscreen = useCallback(async () => {
+    if (isBrowserFullscreen) {
+      await exitBrowserFullscreen();
+    } else {
+      await enterBrowserFullscreen();
+    }
+  }, [isBrowserFullscreen, enterBrowserFullscreen, exitBrowserFullscreen]);
+
   const exitFullscreen = useCallback(async () => {
     setIsFullscreen(false);
+    // Keep browser chrome hidden if user explicitly entered Browser Fullscreen first!
+    if (explicitBrowserFsRef.current) {
+      return;
+    }
     try {
       const doc = document as Document & {
         webkitFullscreenElement?: Element | null;
@@ -2026,6 +2095,10 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       return;
     }
     setIsFullscreen(true);
+    const doc = document as Document & { webkitFullscreenElement?: Element | null };
+    if (document.fullscreenElement || doc.webkitFullscreenElement) {
+      return;
+    }
     try {
       const el = document.documentElement as HTMLElement & {
         webkitRequestFullscreen?: () => Promise<void> | void;
@@ -2741,8 +2814,12 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     showLyricsInPlayer,
     setShowLyricsInPlayer,
     isFullscreen,
+    isBrowserFullscreen,
     toggleFullscreen,
     exitFullscreen,
+    enterBrowserFullscreen,
+    exitBrowserFullscreen,
+    toggleBrowserFullscreen,
     audioSettings,
     personalization,
     activePalette,

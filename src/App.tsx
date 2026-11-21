@@ -9,6 +9,8 @@ import {
   Maximize2,
   MessageSquareText,
   Minimize2,
+  Monitor,
+  MonitorOff,
   Palette,
   Pause,
   Play,
@@ -60,8 +62,11 @@ const LuminaShell: React.FC = () => {
     personalization,
     toastMessage,
     isFullscreen,
+    isBrowserFullscreen,
     toggleFullscreen,
     exitFullscreen,
+    toggleBrowserFullscreen,
+    exitBrowserFullscreen,
   } = useMusic();
   const { runningCount, queuedCount } = useTaskCenter();
   const activeTaskCount = runningCount + queuedCount;
@@ -156,15 +161,40 @@ const LuminaShell: React.FC = () => {
           </nav>
         </div>
 
-        <div className="space-y-3">
+        <div className="space-y-2.5">
           <button
             type="button"
             onClick={toggleFullscreen}
-            title="全屏展示"
-            className="w-full min-h-[44px] flex items-center justify-center lg:justify-start gap-3 px-3 py-2 rounded-2xl text-xs font-medium text-white/70 hover:text-white bg-white/[0.05] hover:bg-white/[0.11] border border-white/10 transition-colors cursor-pointer whitespace-nowrap"
+            title="全屏展示对应功能模块"
+            className="w-full min-h-[42px] flex items-center justify-center lg:justify-start gap-3 px-3 py-2 rounded-2xl text-xs font-medium text-white/75 hover:text-white bg-white/[0.05] hover:bg-white/[0.11] border border-white/10 transition-colors cursor-pointer whitespace-nowrap"
           >
             <Maximize2 className="w-4 h-4 shrink-0" />
             <span className="hidden lg:inline">全屏展示</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={isBrowserFullscreen ? exitBrowserFullscreen : toggleBrowserFullscreen}
+            title={
+              isBrowserFullscreen
+                ? '退出浏览器全屏（恢复浏览器顶部标签与地址栏）'
+                : '浏览器全屏显示（隐藏顶部标签与地址栏，保留当前网页界面）'
+            }
+            aria-label={isBrowserFullscreen ? '退出浏览器全屏' : '浏览器全屏'}
+            className={`w-full min-h-[42px] flex items-center justify-center lg:justify-start gap-3 px-3 py-2 rounded-2xl text-xs font-medium transition-colors cursor-pointer whitespace-nowrap border ${
+              isBrowserFullscreen
+                ? 'bg-rose-500/18 hover:bg-rose-500/28 border-rose-400/35 text-rose-100 shadow-sm'
+                : 'bg-white/[0.04] hover:bg-white/[0.1] border-white/10 text-white/65 hover:text-white'
+            }`}
+          >
+            {isBrowserFullscreen ? (
+              <MonitorOff className="w-4 h-4 shrink-0 text-rose-300" />
+            ) : (
+              <Monitor className="w-4 h-4 shrink-0" />
+            )}
+            <span className="hidden lg:inline">
+              {isBrowserFullscreen ? '退出浏览器全屏' : '浏览器全屏'}
+            </span>
           </button>
 
           {/* Mini Docked Now-Playing Control on Sidebar when away from Player */}
@@ -246,6 +276,20 @@ const LuminaShell: React.FC = () => {
         >
           <Minimize2 className="w-4 h-4" />
           <span>退出全屏</span>
+        </button>
+      )}
+
+      {/* Mobile Portrait Bottom-Left Browser Fullscreen Exit Option */}
+      {isBrowserFullscreen && !isFullscreen && (
+        <button
+          type="button"
+          onClick={exitBrowserFullscreen}
+          aria-label="退出浏览器全屏"
+          title="退出浏览器全屏（恢复顶部标签栏）"
+          className="md:hidden fixed bottom-16 left-3 z-30 min-h-[40px] px-3 py-2 rounded-2xl bg-black/65 hover:bg-black/80 backdrop-blur-xl border border-rose-400/35 text-xs font-medium text-rose-100 flex items-center gap-1.5 shadow-xl cursor-pointer"
+        >
+          <MonitorOff className="w-3.5 h-3.5 text-rose-300" />
+          <span>退出浏览器全屏</span>
         </button>
       )}
 
