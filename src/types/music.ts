@@ -103,6 +103,14 @@ export interface AudioDspSettings {
   instrumentalMuted: boolean;
 }
 
+export interface SavedAudioPreset {
+  id: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+  settings: AudioDspSettings;
+}
+
 export type SeparationEngineMode = 'auto' | 'local' | 'server';
 
 export type SeparationStatus =

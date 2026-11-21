@@ -21,16 +21,21 @@ import {
   getAudioBlob,
   getMvBlobById,
   getTrackStems,
+  loadActiveAudioPresetId,
   loadAudioSettings,
   loadPendingMvTimelines,
   loadPersonalization,
   loadPlaybackPrefs,
+  loadSavedAudioPresets,
+  normalizeAudioSettings,
   requestPersistentStorage,
+  saveActiveAudioPresetId,
   saveAiTasksBatch,
   saveAudioSettings,
   savePersonalization,
   savePlaybackPrefs,
   savePlaylist,
+  saveSavedAudioPresets,
   saveTrackMv,
   saveTrackStems,
   saveTrackWithBlob,
@@ -50,6 +55,7 @@ import {
   PersonalizationSettings,
   PlaybackPrefs,
   Playlist,
+  SavedAudioPreset,
   TrackMetadata,
   TrackMvMeta,
   TrackMvRecord,
@@ -107,6 +113,18 @@ export const MV_TIMELINE_ONLY_BACKUP_OPTIONS: BackupSelectionOptions = {
   includeMvVideos: false,
   includeStems: false,
   includeAudioSettings: false,
+  includePersonalization: false,
+  includeAiData: false,
+};
+
+export const AUDIO_ONLY_BACKUP_OPTIONS: BackupSelectionOptions = {
+  includeTracksMeta: false,
+  includeTrackAudio: false,
+  includePlaylists: false,
+  includeMvTimelines: false,
+  includeMvVideos: false,
+  includeStems: false,
+  includeAudioSettings: true,
   includePersonalization: false,
   includeAiData: false,
 };
@@ -201,6 +219,7 @@ export interface BackupManifestSummary {
   pendingMvTimelinesCount: number;
   stemsCount: number;
   hasAudioSettings: boolean;
+  savedAudioPresetsCount?: number;
   hasPersonalization: boolean;
   aiTasksCount: number;
   aiProvidersCount: number;
@@ -221,6 +240,8 @@ export interface LuminaBackupBundle {
   aiTasks?: AiTaskRecord[];
   settings?: {
     audioSettings?: AudioDspSettings;
+    savedAudioPresets?: SavedAudioPreset[];
+    activeAudioPresetId?: string | null;
     personalization?: PersonalizationSettings;
     playbackPrefs?: PlaybackPrefs;
   };
@@ -244,6 +265,7 @@ export interface BackupLocalInventory {
   mvVideosBytes: number;
   stemsCount: number;
   stemsBytes: number;
+  savedAudioPresetsCount: number;
   aiTasksCount: number;
   aiProvidersCount: number;
   stemServicesCount: number;
@@ -300,6 +322,7 @@ export interface BackupImportSummary {
   mvTimelinesMatchedExisting: number;
   pendingMvsStored: number;
   audioSettingsRestored: boolean;
+  audioPresetsRestored: number;
   personalizationRestored: boolean;
   tasksRestored: number;
   tasksNormalizedToResubmit: number;
@@ -349,6 +372,8 @@ interface ExportContextData {
   pendingMvTimelines: PendingMvTimelineRecord[];
   aiTasks: AiTaskRecord[];
   audioSettings?: AudioDspSettings;
+  savedAudioPresets: SavedAudioPreset[];
+  activeAudioPresetId?: string | null;
   personalization?: PersonalizationSettings;
   playbackPrefs?: PlaybackPrefs;
   aiConfigMetadata: NonNullable<LuminaBackupBundle['aiConfigMetadata']>;
@@ -493,6 +518,7 @@ export async function getBackupLocalInventory(): Promise<BackupLocalInventory> {
     mvMetas,
     pendingMvs,
     stemMetas,
+    savedAudioPresets,
     aiTasks,
     providerResp,
     stemServiceResp,
@@ -502,6 +528,7 @@ export async function getBackupLocalInventory(): Promise<BackupLocalInventory> {
     getAllMvMetas(),
     loadPendingMvTimelines(),
     getAllStemMetas(),
+    loadSavedAudioPresets(),
     getAllAiTasks(),
     fetchProviders().catch(() => ({
       defaultProviderId: null,
@@ -548,6 +575,7 @@ export async function getBackupLocalInventory(): Promise<BackupLocalInventory> {
     mvVideosBytes,
     stemsCount: stemMetas.length,
     stemsBytes,
+    savedAudioPresetsCount: savedAudioPresets.length,
     aiTasksCount: aiTasks.length,
     aiProvidersCount: providerResp.providers?.length || 0,
     stemServicesCount: stemServiceResp.services?.length || 0,
@@ -566,6 +594,8 @@ async function gatherExportContext(
     pendingMvTimelines,
     aiTasks,
     audioSettings,
+    savedAudioPresets,
+    activeAudioPresetId,
     personalization,
     playbackPrefs,
     providerResp,
@@ -584,6 +614,10 @@ async function gatherExportContext(
       : Promise.resolve([] as PendingMvTimelineRecord[]),
     options.includeAiData ? getAllAiTasks() : Promise.resolve([] as AiTaskRecord[]),
     options.includeAudioSettings ? loadAudioSettings() : Promise.resolve(undefined),
+    options.includeAudioSettings
+      ? loadSavedAudioPresets()
+      : Promise.resolve([] as SavedAudioPreset[]),
+    options.includeAudioSettings ? loadActiveAudioPresetId() : Promise.resolve(null),
     options.includePersonalization ? loadPersonalization() : Promise.resolve(undefined),
     options.includePersonalization ? loadPlaybackPrefs() : Promise.resolve(undefined),
     options.includeAiData
@@ -652,7 +686,8 @@ async function gatherExportContext(
       : 0,
     pendingMvTimelinesCount: pendingToExport.length,
     stemsCount: stemMetas.length,
-    hasAudioSettings: Boolean(audioSettings),
+    hasAudioSettings: Boolean(audioSettings || savedAudioPresets.length > 0),
+    savedAudioPresetsCount: options.includeAudioSettings ? savedAudioPresets.length : 0,
     hasPersonalization: Boolean(personalization || playbackPrefs),
     aiTasksCount: aiTasks.length,
     aiProvidersCount: safeProviders.length,
@@ -668,6 +703,8 @@ async function gatherExportContext(
     pendingMvTimelines: pendingToExport,
     aiTasks,
     audioSettings,
+    savedAudioPresets,
+    activeAudioPresetId,
     personalization,
     playbackPrefs,
     aiConfigMetadata: {
@@ -870,6 +907,12 @@ async function exportToDiskStreamLumina(
       aiTasks: ctx.aiTasks,
       settings: {
         ...(ctx.audioSettings ? { audioSettings: ctx.audioSettings } : {}),
+        ...(ctx.savedAudioPresets.length > 0
+          ? { savedAudioPresets: ctx.savedAudioPresets }
+          : {}),
+        ...(ctx.activeAudioPresetId
+          ? { activeAudioPresetId: ctx.activeAudioPresetId }
+          : {}),
         ...(ctx.personalization ? { personalization: ctx.personalization } : {}),
         ...(ctx.playbackPrefs ? { playbackPrefs: ctx.playbackPrefs } : {}),
       },
@@ -959,6 +1002,12 @@ async function exportZeroCopyBinaryVolumes(
       settings: isFirst
         ? {
             ...(ctx.audioSettings ? { audioSettings: ctx.audioSettings } : {}),
+            ...(ctx.savedAudioPresets.length > 0
+              ? { savedAudioPresets: ctx.savedAudioPresets }
+              : {}),
+            ...(ctx.activeAudioPresetId
+              ? { activeAudioPresetId: ctx.activeAudioPresetId }
+              : {}),
             ...(ctx.personalization ? { personalization: ctx.personalization } : {}),
             ...(ctx.playbackPrefs ? { playbackPrefs: ctx.playbackPrefs } : {}),
           }
@@ -1238,6 +1287,12 @@ async function exportLightweightJson(
   parts.push(
     `"settings":${JSON.stringify({
       ...(ctx.audioSettings ? { audioSettings: ctx.audioSettings } : {}),
+      ...(ctx.savedAudioPresets.length > 0
+        ? { savedAudioPresets: ctx.savedAudioPresets }
+        : {}),
+      ...(ctx.activeAudioPresetId
+        ? { activeAudioPresetId: ctx.activeAudioPresetId }
+        : {}),
       ...(ctx.personalization ? { personalization: ctx.personalization } : {}),
       ...(ctx.playbackPrefs ? { playbackPrefs: ctx.playbackPrefs } : {}),
     })},`
@@ -1321,10 +1376,21 @@ async function exportLightweightJson(
   parts.push('}');
 
   const blob = new Blob(parts, { type: 'application/json' });
-  const suffix =
-    !options.includeTrackAudio && !options.includeMvVideos && !options.includeStems
-      ? 'config'
-      : 'light';
+  const isAudioPresetOnly =
+    options.includeAudioSettings &&
+    !options.includeTracksMeta &&
+    !options.includeTrackAudio &&
+    !options.includePlaylists &&
+    !options.includeMvTimelines &&
+    !options.includeMvVideos &&
+    !options.includeStems &&
+    !options.includePersonalization &&
+    !options.includeAiData;
+  const suffix = isAudioPresetOnly
+    ? 'audio-presets'
+    : !options.includeTrackAudio && !options.includeMvVideos && !options.includeStems
+    ? 'config'
+    : 'light';
   const filename = `lumina-music-${suffix}-backup-${stamp}.json`;
 
   return {
@@ -1839,6 +1905,7 @@ function buildManifestFromBundle(parsed: Partial<LuminaBackupBundle>): BackupMan
   const tracks = parsed.tracks || [];
   const mvs = parsed.mvs || [];
   const pending = parsed.pendingMvTimelines || [];
+  const savedPresetsCount = parsed.settings?.savedAudioPresets?.length || 0;
   return {
     tracksMetaCount: tracks.length,
     tracksAudioCount: tracks.filter((t) => Boolean(t?.audioBase64)).length,
@@ -1847,7 +1914,8 @@ function buildManifestFromBundle(parsed: Partial<LuminaBackupBundle>): BackupMan
     mvVideosCount: mvs.filter((m) => Boolean(m?.videoBase64)).length,
     pendingMvTimelinesCount: pending.length,
     stemsCount: (parsed.stems || []).length,
-    hasAudioSettings: Boolean(parsed.settings?.audioSettings),
+    hasAudioSettings: Boolean(parsed.settings?.audioSettings || savedPresetsCount > 0),
+    savedAudioPresetsCount: savedPresetsCount,
     hasPersonalization: Boolean(
       parsed.settings?.personalization || parsed.settings?.playbackPrefs
     ),
@@ -1867,7 +1935,8 @@ function deriveAvailableImportOptions(
     includeMvTimelines: manifest.mvTimelinesCount > 0,
     includeMvVideos: manifest.mvVideosCount > 0,
     includeStems: manifest.stemsCount > 0,
-    includeAudioSettings: manifest.hasAudioSettings,
+    includeAudioSettings:
+      manifest.hasAudioSettings || (manifest.savedAudioPresetsCount || 0) > 0,
     includePersonalization: manifest.hasPersonalization,
     includeAiData:
       manifest.aiTasksCount > 0 ||
@@ -1886,6 +1955,7 @@ export async function inspectLuminaBackupFile(
       if (vol.format !== 'lumina-music-backup') {
         throw new Error('无效的 .lumina 备份文件');
       }
+      const volPresetsCount = vol.settings?.savedAudioPresets?.length || 0;
       const volManifest: BackupManifestSummary = {
         tracksMetaCount: new Set(vol.tracks.filter((t) => t.includeMeta !== false).map((t) => t.track.id)).size,
         tracksAudioCount: new Set(vol.tracks.filter((t) => Boolean(t.audioBlobRef)).map((t) => t.track.id)).size,
@@ -1895,7 +1965,8 @@ export async function inspectLuminaBackupFile(
         mvVideosCount: new Set(vol.mvs.filter((m) => Boolean(m.videoBlobRef)).map((m) => m.meta.id)).size,
         pendingMvTimelinesCount: vol.pendingMvTimelines.length,
         stemsCount: new Set(vol.stems.map((s) => s.trackId)).size,
-        hasAudioSettings: Boolean(vol.settings?.audioSettings),
+        hasAudioSettings: Boolean(vol.settings?.audioSettings || volPresetsCount > 0),
+        savedAudioPresetsCount: volPresetsCount,
         hasPersonalization: Boolean(vol.settings?.personalization || vol.settings?.playbackPrefs),
         aiTasksCount: vol.aiTasks.length,
         aiProvidersCount: vol.aiConfigMetadata?.providers?.length || 0,
@@ -1978,7 +2049,11 @@ export async function inspectLuminaBackupFile(
     mvVideosCount: mvVideoCount,
     pendingMvTimelinesCount: (collected.pendingMvTimelines || []).length,
     stemsCount: stemCount,
-    hasAudioSettings: Boolean(collected.settings?.audioSettings),
+    hasAudioSettings: Boolean(
+      collected.settings?.audioSettings ||
+        (collected.settings?.savedAudioPresets?.length || 0) > 0
+    ),
+    savedAudioPresetsCount: collected.settings?.savedAudioPresets?.length || 0,
     hasPersonalization: Boolean(
       collected.settings?.personalization || collected.settings?.playbackPrefs
     ),
@@ -2021,6 +2096,7 @@ export async function inspectLuminaBackupFiles(
     pendingMvTimelinesCount: 0,
     stemsCount: 0,
     hasAudioSettings: false,
+    savedAudioPresetsCount: 0,
     hasPersonalization: false,
     aiTasksCount: 0,
     aiProvidersCount: 0,
@@ -2038,6 +2114,10 @@ export async function inspectLuminaBackupFiles(
     combined.pendingMvTimelinesCount += it.manifest.pendingMvTimelinesCount;
     combined.stemsCount += it.manifest.stemsCount;
     if (it.manifest.hasAudioSettings) combined.hasAudioSettings = true;
+    combined.savedAudioPresetsCount = Math.max(
+      combined.savedAudioPresetsCount || 0,
+      it.manifest.savedAudioPresetsCount || 0
+    );
     if (it.manifest.hasPersonalization) combined.hasPersonalization = true;
     combined.aiTasksCount += it.manifest.aiTasksCount;
     combined.aiProvidersCount = Math.max(
@@ -2279,6 +2359,7 @@ export async function importLuminaBackupFiles(
   let mvTimelinesMatchedExisting = 0;
   let pendingMvsStored = 0;
   let audioSettingsRestored = false;
+  let audioPresetsRestored = 0;
   let personalizationRestored = false;
   let tasksNormalizedToResubmit = 0;
   let tasksRestored = 0;
@@ -2869,10 +2950,58 @@ export async function importLuminaBackupFiles(
     }
   }
 
-  if (options.includeAudioSettings && settingsData?.audioSettings) {
-    onProgress?.('正在自动保存音效与 DSP 参数...');
-    await saveAudioSettings(settingsData.audioSettings);
-    audioSettingsRestored = true;
+  if (options.includeAudioSettings && settingsData) {
+    if (settingsData.audioSettings) {
+      onProgress?.('正在自动保存音效与 DSP 参数...');
+      await saveAudioSettings(normalizeAudioSettings(settingsData.audioSettings));
+      audioSettingsRestored = true;
+    }
+
+    const incomingPresets = Array.isArray(settingsData.savedAudioPresets)
+      ? settingsData.savedAudioPresets.filter(
+          (p): p is SavedAudioPreset => Boolean(p && p.id && p.name && p.settings)
+        )
+      : [];
+
+    if (importMode === 'replace' && options.includeAudioSettings) {
+      const cleaned = incomingPresets.map((p) => ({
+        ...p,
+        settings: normalizeAudioSettings(p.settings),
+      }));
+      await saveSavedAudioPresets(cleaned);
+      audioPresetsRestored = cleaned.length;
+      await saveActiveAudioPresetId(settingsData.activeAudioPresetId ?? null);
+    } else if (incomingPresets.length > 0) {
+      onProgress?.('正在自动合并并保存音效预设方案...');
+      const existingPresets = await loadSavedAudioPresets();
+      const merged = [...existingPresets];
+      for (const item of incomingPresets) {
+        const cleanItem: SavedAudioPreset = {
+          ...item,
+          settings: normalizeAudioSettings(item.settings),
+        };
+        const idx = merged.findIndex(
+          (cur) =>
+            cur.id === cleanItem.id ||
+            normalizeStr(cur.name) === normalizeStr(cleanItem.name)
+        );
+        if (idx >= 0) {
+          merged[idx] = {
+            ...merged[idx],
+            ...cleanItem,
+            id: merged[idx].id,
+            updatedAt: cleanItem.updatedAt || Date.now(),
+          };
+        } else {
+          merged.unshift(cleanItem);
+        }
+        audioPresetsRestored++;
+      }
+      await saveSavedAudioPresets(merged);
+      if (settingsData.activeAudioPresetId !== undefined) {
+        await saveActiveAudioPresetId(settingsData.activeAudioPresetId ?? null);
+      }
+    }
   }
 
   if (options.includePersonalization) {
@@ -2948,6 +3077,7 @@ export async function importLuminaBackupFiles(
     mvTimelinesMatchedExisting,
     pendingMvsStored,
     audioSettingsRestored,
+    audioPresetsRestored,
     personalizationRestored,
     tasksRestored,
     tasksNormalizedToResubmit,

@@ -242,8 +242,114 @@ export interface OnlineLyricResult {
 
 export type LyricTargetLanguage = 'zh-CN' | 'zh-TW' | 'en' | 'ja';
 
+async function parseJsonSafely<T>(res: Response): Promise<T | null> {
+  if (!res.ok) return null;
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  const rawText = await res.text();
+  const trimmed = rawText.trim();
+  if (!trimmed) return null;
+  // Static hosts (e.g. Netlify SPA rewrite) return index.html with HTTP 200 for unknown /api/* routes
+  if (
+    contentType.includes('text/html') ||
+    trimmed.startsWith('<!doctype') ||
+    trimmed.startsWith('<!DOCTYPE') ||
+    trimmed.startsWith('<html') ||
+    trimmed.startsWith('<')
+  ) {
+    return null;
+  }
+  try {
+    return JSON.parse(trimmed) as T;
+  } catch {
+    return null;
+  }
+}
+
+interface RawLrclibItem {
+  id: number;
+  trackName?: string;
+  name?: string;
+  artistName?: string;
+  albumName?: string;
+  duration?: number;
+  syncedLyrics?: string | null;
+  plainLyrics?: string | null;
+}
+
+function normalizeLrclibItems(items: RawLrclibItem[]): OnlineLyricResult[] {
+  return items
+    .filter((item) => Boolean(item && (item.syncedLyrics?.trim() || item.plainLyrics?.trim())))
+    .map((item) => ({
+      id: item.id,
+      trackName: (item.trackName || item.name || '').trim(),
+      artistName: (item.artistName || '').trim(),
+      albumName: (item.albumName || '').trim(),
+      duration: Math.round(Number(item.duration) || 0),
+      syncedLyrics: item.syncedLyrics?.trim() ? item.syncedLyrics : null,
+      plainLyrics: item.plainLyrics?.trim() ? item.plainLyrics : null,
+      hasNativeTranslation: false,
+      source: 'LRCLIB',
+    }));
+}
+
+async function fetchDirectLrclibQuery(url: string): Promise<{
+  ok: boolean;
+  status: number;
+  items: OnlineLyricResult[];
+}> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) {
+      return { ok: false, status: res.status, items: [] };
+    }
+    const parsed = await parseJsonSafely<RawLrclibItem[]>(res);
+    if (!Array.isArray(parsed)) {
+      return { ok: false, status: res.status, items: [] };
+    }
+    return { ok: true, status: res.status, items: normalizeLrclibItems(parsed) };
+  } catch {
+    return { ok: false, status: 0, items: [] };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function sortOnlineLyrics(list: OnlineLyricResult[], targetTitle: string): OnlineLyricResult[] {
+  const normTarget = targetTitle.toLowerCase().trim();
+  return [...list].sort((a, b) => {
+    if (a.hasNativeTranslation && !b.hasNativeTranslation) return -1;
+    if (!a.hasNativeTranslation && b.hasNativeTranslation) return 1;
+    if (a.syncedLyrics && !b.syncedLyrics) return -1;
+    if (!a.syncedLyrics && b.syncedLyrics) return 1;
+    const aExact = a.trackName.toLowerCase().trim() === normTarget ? 1 : 0;
+    const bExact = b.trackName.toLowerCase().trim() === normTarget ? 1 : 0;
+    if (aExact !== bExact) return bExact - aExact;
+    return 0;
+  });
+}
+
+function deduplicateLyrics(list: OnlineLyricResult[]): OnlineLyricResult[] {
+  const seen = new Set<string>();
+  const out: OnlineLyricResult[] = [];
+  for (const item of list) {
+    const key = `${item.source || 'LRCLIB'}:${item.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
 /**
- * Searches multi-source online LRC lyrics (Native bilingual NetEase tlyric + LRCLIB).
+ * Searches multi-source online LRC lyrics:
+ * 1) Full-stack Express API (/api/lyrics/search)
+ * 2) Netlify Serverless Function (/.netlify/functions/lyrics-search)
+ * 3) Pure client-side CORS fallback directly against LRCLIB (guarantees static Netlify Drag & Drop support)
  */
 export async function searchOnlineLyrics(
   title: string,
@@ -251,37 +357,80 @@ export async function searchOnlineLyrics(
 ): Promise<OnlineLyricResult[]> {
   const cleanTitle = title.replace(/\.[^.]+$/, '').trim();
   const cleanArtist =
-    artist && artist !== '未知艺术家' && artist !== 'Unknown Artist' ? artist.trim() : '';
+    artist &&
+    artist !== '未知艺术家' &&
+    artist !== 'Unknown Artist' &&
+    artist !== 'Lumina Acoustic Ensemble'
+      ? artist.trim()
+      : '';
 
   const query = [cleanTitle, cleanArtist].filter(Boolean).join(' ');
   if (!query) return [];
 
-  let data: OnlineLyricResult[];
-  const apiRes = await fetch(`/api/lyrics/search?q=${encodeURIComponent(query)}`, {
-    headers: { Accept: 'application/json' },
-  });
+  const qs = new URLSearchParams({ q: query });
+  if (cleanTitle) qs.set('title', cleanTitle);
+  if (cleanArtist) qs.set('artist', cleanArtist);
 
-  if (apiRes.ok) {
-    data = (await apiRes.json()) as OnlineLyricResult[];
-  } else {
-    // Fallback to direct LRCLIB endpoint if backend route unavailable
-    const directRes = await fetch(
-      `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`,
-      { headers: { Accept: 'application/json' } }
-    );
-    if (!directRes.ok) {
-      throw new Error(`歌词检索请求失败 (${directRes.status})`);
+  // Stage 1: Express backend (/api/lyrics/search)
+  try {
+    const apiRes = await fetch(`/api/lyrics/search?${qs.toString()}`, {
+      headers: { Accept: 'application/json' },
+    });
+    const apiData = await parseJsonSafely<OnlineLyricResult[]>(apiRes);
+    if (Array.isArray(apiData) && apiData.length > 0) {
+      return sortOnlineLyrics(deduplicateLyrics(apiData), cleanTitle);
     }
-    data = (await directRes.json()) as OnlineLyricResult[];
+  } catch {
+    // Backend unavailable, fall through
   }
 
-  return data.sort((a, b) => {
-    if (a.hasNativeTranslation && !b.hasNativeTranslation) return -1;
-    if (!a.hasNativeTranslation && b.hasNativeTranslation) return 1;
-    if (a.syncedLyrics && !b.syncedLyrics) return -1;
-    if (!a.syncedLyrics && b.syncedLyrics) return 1;
-    return 0;
-  });
+  // Stage 2: Netlify Functions endpoint (available when deployed via Git / Netlify CLI)
+  try {
+    const nfRes = await fetch(`/.netlify/functions/lyrics-search?${qs.toString()}`, {
+      headers: { Accept: 'application/json' },
+    });
+    const nfData = await parseJsonSafely<OnlineLyricResult[]>(nfRes);
+    if (Array.isArray(nfData) && nfData.length > 0) {
+      return sortOnlineLyrics(deduplicateLyrics(nfData), cleanTitle);
+    }
+  } catch {
+    // Netlify Functions unavailable (e.g. static dist upload), fall through
+  }
+
+  // Stage 3: Direct browser CORS query to LRCLIB (works on static Netlify without any backend)
+  const urls: string[] = [];
+  if (cleanTitle && cleanArtist) {
+    urls.push(
+      `https://lrclib.net/api/search?track_name=${encodeURIComponent(
+        cleanTitle
+      )}&artist_name=${encodeURIComponent(cleanArtist)}`
+    );
+  }
+  urls.push(`https://lrclib.net/api/search?q=${encodeURIComponent(query)}`);
+
+  const primaryAttempts = await Promise.all(urls.map((u) => fetchDirectLrclibQuery(u)));
+  let combined = deduplicateLyrics(primaryAttempts.flatMap((a) => a.items));
+  let anySucceeded = primaryAttempts.some((a) => a.ok);
+
+  // Fallback to title-only query if combined title+artist yielded zero matches
+  if (combined.length === 0 && cleanTitle && cleanArtist) {
+    const titleOnly = await fetchDirectLrclibQuery(
+      `https://lrclib.net/api/search?q=${encodeURIComponent(cleanTitle)}`
+    );
+    if (titleOnly.ok) anySucceeded = true;
+    combined = deduplicateLyrics(titleOnly.items);
+  }
+
+  if (!anySucceeded && combined.length === 0) {
+    const failedStatus = primaryAttempts.find((a) => a.status > 0)?.status;
+    throw new Error(
+      failedStatus
+        ? `歌词检索请求失败 (${failedStatus})，请稍后重试`
+        : '在线歌词服务连接超时或网络不可用，请检查网络或代理设置后重试'
+    );
+  }
+
+  return sortOnlineLyrics(combined, cleanTitle);
 }
 
 export async function translateLyricsToBilingual(
@@ -301,7 +450,7 @@ export async function translateLyricsToBilingual(
 }> {
   const res = await fetch('/api/lyrics/translate', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({
       rawLyrics,
       trackTitle,
@@ -313,12 +462,36 @@ export async function translateLyricsToBilingual(
     }),
   });
 
-  const payload = await res.json();
-  if (!res.ok) {
-    throw new Error(payload?.error || `歌词翻译失败 (${res.status})`);
+  const rawText = await res.text();
+  const trimmed = rawText.trim();
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+
+  if (
+    contentType.includes('text/html') ||
+    trimmed.startsWith('<!doctype') ||
+    trimmed.startsWith('<!DOCTYPE') ||
+    trimmed.startsWith('<html') ||
+    trimmed.startsWith('<')
+  ) {
+    throw new Error(
+      '当前处于纯静态托管环境（如 Netlify），未运行后端 AI 翻译服务'
+    );
   }
 
-  return payload as {
+  let payload: Record<string, unknown> | null = null;
+  try {
+    payload = trimmed ? (JSON.parse(trimmed) as Record<string, unknown>) : null;
+  } catch {
+    throw new Error(`歌词翻译服务返回了无效响应 (${res.status})`);
+  }
+
+  if (!res.ok || !payload) {
+    const errMsg =
+      payload && typeof payload.error === 'string' ? payload.error : '';
+    throw new Error(errMsg || `歌词翻译失败 (${res.status})`);
+  }
+
+  return payload as unknown as {
     bilingualLyrics: string;
     translatedCount: number;
     skippedReason?: string;

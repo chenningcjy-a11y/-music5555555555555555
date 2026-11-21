@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
 import {
   Bot,
   Disc3,
@@ -65,6 +65,14 @@ const LuminaShell: React.FC = () => {
   } = useMusic();
   const { runningCount, queuedCount } = useTaskCenter();
   const activeTaskCount = runningCount + queuedCount;
+  const mainScrollRef = useRef<HTMLElement | null>(null);
+  const isLockedStage = activePage === 'player' || activePage === 'lyrics';
+
+  useEffect(() => {
+    if (mainScrollRef.current && !isLockedStage) {
+      mainScrollRef.current.scrollTop = 0;
+    }
+  }, [activePage, isLockedStage]);
 
   const fontClass =
     personalization.fontPreset === 'editorial'
@@ -78,7 +86,7 @@ const LuminaShell: React.FC = () => {
       : 'font-sans-modern';
 
   return (
-    <div className={`relative flex flex-col md:flex-row h-screen w-screen overflow-hidden ${fontClass}`}>
+    <div className={`relative flex flex-col md:flex-row h-full w-full overflow-hidden ${fontClass}`}>
       {/* Real-time Audio-Reactive Liquid Fluid Background */}
       <DynamicBackground
         palette={activePalette}
@@ -92,7 +100,7 @@ const LuminaShell: React.FC = () => {
 
       {/* Desktop & Landscape Tablet Left Glass Navigation Rail */}
       {!isFullscreen && (
-        <aside className="hidden md:flex flex-col justify-between w-20 lg:w-60 shrink-0 h-full bg-black/25 backdrop-blur-2xl border-r border-white/10 p-3 lg:p-4 z-20">
+        <aside className="hidden md:flex flex-col justify-between w-20 lg:w-60 shrink-0 h-full overflow-y-auto overflow-x-hidden lumina-scroll bg-black/25 backdrop-blur-2xl border-r border-white/10 p-3 lg:p-4 z-20">
         <div className="space-y-6">
           {/* Single-line Brand Wordmark */}
           <button
@@ -209,8 +217,11 @@ const LuminaShell: React.FC = () => {
 
       {/* Main Content Stage */}
       <main
-        className={`flex-1 h-full min-w-0 min-h-0 overflow-hidden relative z-10 ${
-          isFullscreen ? 'pb-0' : 'pb-14 md:pb-0'
+        ref={mainScrollRef}
+        className={`flex-1 h-full min-w-0 min-h-0 relative z-10 ${
+          isLockedStage
+            ? `overflow-hidden ${isFullscreen ? 'pb-0' : 'pb-14 md:pb-0'}`
+            : 'overflow-y-auto overflow-x-hidden lumina-scroll'
         }`}
       >
         {activePage === 'player' && <PlayerPage />}

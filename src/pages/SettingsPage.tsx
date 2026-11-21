@@ -20,6 +20,7 @@ import { useAi } from '../context/AiContext';
 import { useMusic } from '../context/MusicContext';
 import { useTaskCenter } from '../context/TaskCenterContext';
 import {
+  AUDIO_ONLY_BACKUP_OPTIONS,
   BackupLocalInventory,
   DEFAULT_BACKUP_EXPORT_OPTIONS,
   ExportedBackupVolume,
@@ -34,7 +35,12 @@ import {
   MV_TIMELINE_ONLY_BACKUP_OPTIONS,
   SAFE_BROWSER_VOLUME_BYTES,
 } from '../services/backupService';
-import { getStorageEstimate } from '../services/storage';
+import {
+  getStorageEstimate,
+  requestPersistentStorage,
+  StorageEstimateInfo,
+  TARGET_APP_QUOTA_BYTES,
+} from '../services/storage';
 import {
   AnimationIntensity,
   BackupSelectionOptions,
@@ -125,6 +131,7 @@ export const SettingsPage: React.FC = () => {
     updatePersonalization,
     activePalette,
     tracks,
+    savedAudioPresets,
     pendingMvTimelines,
     removePendingMvTimeline,
     resetLibrary,
@@ -140,10 +147,13 @@ export const SettingsPage: React.FC = () => {
   } = useAi();
   const { reloadTasksFromStorage } = useTaskCenter();
 
-  const [storageInfo, setStorageInfo] = useState<{
-    usageBytes: number;
-    quotaBytes: number;
-  }>({ usageBytes: 0, quotaBytes: 0 });
+  const [storageInfo, setStorageInfo] = useState<StorageEstimateInfo>({
+    usageBytes: 0,
+    quotaBytes: TARGET_APP_QUOTA_BYTES,
+    browserQuotaBytes: 0,
+    targetQuotaBytes: TARGET_APP_QUOTA_BYTES,
+    persisted: false,
+  });
   const [inventory, setInventory] = useState<BackupLocalInventory | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const [backupBusy, setBackupBusy] = useState(false);
@@ -192,9 +202,19 @@ export const SettingsPage: React.FC = () => {
     if (inv) setInventory(inv);
   }, []);
 
+  const handleRequestPersistentQuota = async () => {
+    const granted = await requestPersistentStorage();
+    await refreshStorage();
+    if (granted) {
+      showToast('已开启浏览器持久化存储保护（应用配额上限 100.0 GB）');
+    } else {
+      showToast('浏览器暂未授予免清理持久化权限，请安装到桌面或保持空间充足');
+    }
+  };
+
   useEffect(() => {
     void refreshStorage();
-  }, [tracks.length, pendingMvTimelines.length, refreshStorage]);
+  }, [tracks.length, pendingMvTimelines.length, savedAudioPresets.length, refreshStorage]);
 
   const estimatedExportBytes = useMemo(() => {
     if (!inventory) return 0;
@@ -430,7 +450,13 @@ export const SettingsPage: React.FC = () => {
           `${summary.pendingMvsStored} 条未上传视频的 MV 前瞻/后端时间已自动暂存（导入对应 MV 时自动匹配生效）`
         );
       }
-      if (summary.audioSettingsRestored) parts.push('音效与 DSP 调音参数');
+      if (summary.audioSettingsRestored || summary.audioPresetsRestored > 0) {
+        const presetLabel =
+          summary.audioPresetsRestored > 0
+            ? `（含 ${summary.audioPresetsRestored} 套音效预设）`
+            : '';
+        parts.push(`音效与 DSP 调音参数${presetLabel}`);
+      }
       if (summary.personalizationRestored) parts.push('个性化外观与播放偏好');
       if (summary.tasksRestored > 0) {
         parts.push(
@@ -463,13 +489,17 @@ export const SettingsPage: React.FC = () => {
     }
   };
 
+  const effectiveQuotaBytes = Math.max(
+    storageInfo.quotaBytes,
+    storageInfo.targetQuotaBytes || TARGET_APP_QUOTA_BYTES
+  );
   const usagePct =
-    storageInfo.quotaBytes > 0
-      ? Math.min(100, (storageInfo.usageBytes / storageInfo.quotaBytes) * 100)
+    effectiveQuotaBytes > 0
+      ? Math.min(100, (storageInfo.usageBytes / effectiveQuotaBytes) * 100)
       : 0;
 
   return (
-    <div className="h-full overflow-y-auto lumina-scroll px-4 sm:px-6 lg:px-10 py-6 space-y-6">
+    <div className="min-h-full px-4 sm:px-6 lg:px-10 py-6 pb-24 md:pb-12 space-y-6">
       <div>
         <h1 className="font-display text-2xl sm:text-3xl font-semibold text-white">
           个性化与系统设置
@@ -762,24 +792,33 @@ export const SettingsPage: React.FC = () => {
             <h2 className="text-base font-semibold text-white">本地存储管理 (IndexedDB)</h2>
           </div>
 
-          <button
-            type="button"
-            onClick={refreshStorage}
-            className="p-2 rounded-xl bg-white/8 hover:bg-white/14 text-white/70 hover:text-white transition-colors cursor-pointer"
-            title="刷新存储空间统计"
-          >
-            <RefreshCw className="w-4 h-4" />
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleRequestPersistentQuota}
+              className="px-3 py-1.5 rounded-xl bg-white/10 hover:bg-white/16 border border-white/14 text-xs font-medium text-white/90 transition-colors cursor-pointer"
+            >
+              {storageInfo.persisted ? '持久化保护已开启 (100 GB)' : '申请 100 GB 持久化存储'}
+            </button>
+            <button
+              type="button"
+              onClick={refreshStorage}
+              className="p-2 rounded-xl bg-white/8 hover:bg-white/14 text-white/70 hover:text-white transition-colors cursor-pointer"
+              title="刷新存储空间统计"
+            >
+              <RefreshCw className="w-4 h-4" />
+            </button>
+          </div>
         </div>
 
         <div className="space-y-2">
-          <div className="flex justify-between text-xs text-white/75 font-mono-tabular">
-            <span>已保存 {tracks.length} 首曲目 · 已用 {formatFileSize(storageInfo.usageBytes)}</span>
+          <div className="flex flex-wrap justify-between gap-2 text-xs text-white/75 font-mono-tabular">
             <span>
-              可用配额{' '}
-              {storageInfo.quotaBytes > 0
-                ? `${(storageInfo.quotaBytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
-                : '未知'}
+              已保存 {tracks.length} 首曲目 · {savedAudioPresets.length} 套音效预设 · 已用{' '}
+              {formatFileSize(storageInfo.usageBytes)}
+            </span>
+            <span>
+              可用配额 {(effectiveQuotaBytes / (1024 * 1024 * 1024)).toFixed(1)} GB
             </span>
           </div>
 
@@ -792,6 +831,15 @@ export const SettingsPage: React.FC = () => {
               }}
             />
           </div>
+
+          {storageInfo.browserQuotaBytes > 0 &&
+            storageInfo.browserQuotaBytes < effectiveQuotaBytes && (
+              <p className="text-[11px] text-white/50 leading-relaxed">
+                应用已扩展至 100.0 GB 配额管理；注：当前浏览器内核报告设备可用沙盒上限约为{' '}
+                {(storageInfo.browserQuotaBytes / (1024 * 1024 * 1024)).toFixed(1)} GB
+                （实际可写入容量仍取决于设备剩余存储与浏览器磁盘策略，大曲库建议配合下方分卷导出备份）。
+              </p>
+            )}
         </div>
 
         {backupProgress && (
@@ -925,6 +973,13 @@ export const SettingsPage: React.FC = () => {
                 >
                   仅 MV 前瞻/后端时间
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setExportOptions({ ...AUDIO_ONLY_BACKUP_OPTIONS })}
+                  className="px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/18 text-[11px] text-white cursor-pointer"
+                >
+                  仅音效与预设方案
+                </button>
               </div>
             </div>
 
@@ -969,8 +1024,10 @@ export const SettingsPage: React.FC = () => {
                   },
                   {
                     key: 'includeAudioSettings',
-                    title: '音质与 DSP 音效调整',
-                    desc: '7 段均衡器 EQ、3D 环绕、耳机优化、混响、低高音与人声平衡比例',
+                    title: '音质、DSP 音效与已保存音效方案',
+                    desc: `含 ${
+                      inventory?.savedAudioPresetsCount ?? savedAudioPresets.length
+                    } 套已保存音效方案、7 段均衡器 EQ、3D 环绕、混响与人声平衡比例`,
                   },
                   {
                     key: 'includePersonalization',
@@ -1287,10 +1344,12 @@ export const SettingsPage: React.FC = () => {
                   {
                     key: 'includeAudioSettings',
                     available: inspectedBatch.availableOptions.includeAudioSettings,
-                    title: '调整过的音质与 DSP 音效参数',
-                    desc: inspectedBatch.manifest.hasAudioSettings
-                      ? '包含 7 段均衡器 EQ、环绕声、混响、人声/伴奏平衡等调整'
-                      : '此备份包未包含音质参数',
+                    title: '调整过的音质、DSP 音效与已保存音效方案',
+                    desc: inspectedBatch.availableOptions.includeAudioSettings
+                      ? `包含 ${
+                          inspectedBatch.manifest.savedAudioPresetsCount ?? 0
+                        } 套已保存音效方案、7 段均衡器 EQ、环绕声与混响等调整`
+                      : '此备份包未包含音质参数或音效方案',
                   },
                   {
                     key: 'includePersonalization',

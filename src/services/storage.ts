@@ -5,6 +5,7 @@ import {
   PersonalizationSettings,
   PlaybackPrefs,
   Playlist,
+  SavedAudioPreset,
   TrackMetadata,
   TrackMvMeta,
   TrackMvRecord,
@@ -262,11 +263,76 @@ async function setSetting<T>(key: string, value: T): Promise<void> {
   await wrapRequest(tx.objectStore(STORE_SETTINGS).put(value, key));
 }
 
-export const loadAudioSettings = () =>
-  getSetting<AudioDspSettings>('audioSettings', DEFAULT_AUDIO_SETTINGS);
+export function normalizeAudioSettings(
+  raw?: Partial<AudioDspSettings> | null
+): AudioDspSettings {
+  const merged = {
+    ...DEFAULT_AUDIO_SETTINGS,
+    ...(raw || {}),
+  };
+  const gains =
+    Array.isArray(raw?.eqGains) && raw.eqGains.length === 7
+      ? ([...raw.eqGains] as AudioDspSettings['eqGains'])
+      : ([...DEFAULT_AUDIO_SETTINGS.eqGains] as AudioDspSettings['eqGains']);
+  return {
+    ...merged,
+    eqGains: gains,
+  };
+}
+
+export const loadAudioSettings = async (): Promise<AudioDspSettings> => {
+  const raw = await getSetting<AudioDspSettings>('audioSettings', DEFAULT_AUDIO_SETTINGS);
+  return normalizeAudioSettings(raw);
+};
 
 export const saveAudioSettings = (s: AudioDspSettings) =>
-  setSetting('audioSettings', s);
+  setSetting('audioSettings', normalizeAudioSettings(s));
+
+const SAVED_AUDIO_PRESETS_KEY = 'savedAudioPresets';
+const ACTIVE_AUDIO_PRESET_ID_KEY = 'activeAudioPresetId';
+
+export async function loadSavedAudioPresets(): Promise<SavedAudioPreset[]> {
+  try {
+    const db = await openDatabase();
+    const tx = db.transaction(STORE_SETTINGS, 'readonly');
+    const raw = await wrapRequest(tx.objectStore(STORE_SETTINGS).get(SAVED_AUDIO_PRESETS_KEY));
+    if (!Array.isArray(raw)) return [];
+    return (raw as SavedAudioPreset[])
+      .filter((item) => Boolean(item && item.id && item.name && item.settings))
+      .map((item) => ({
+        ...item,
+        settings: normalizeAudioSettings(item.settings),
+      }))
+      .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+  } catch {
+    return [];
+  }
+}
+
+export async function saveSavedAudioPresets(
+  presets: SavedAudioPreset[]
+): Promise<void> {
+  const normalized = presets.map((p) => ({
+    ...p,
+    settings: normalizeAudioSettings(p.settings),
+  }));
+  await setSetting(SAVED_AUDIO_PRESETS_KEY, normalized);
+}
+
+export async function loadActiveAudioPresetId(): Promise<string | null> {
+  try {
+    const db = await openDatabase();
+    const tx = db.transaction(STORE_SETTINGS, 'readonly');
+    const raw = await wrapRequest(tx.objectStore(STORE_SETTINGS).get(ACTIVE_AUDIO_PRESET_ID_KEY));
+    return typeof raw === 'string' && raw.length > 0 ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveActiveAudioPresetId(id: string | null): Promise<void> {
+  await setSetting(ACTIVE_AUDIO_PRESET_ID_KEY, id);
+}
 
 export const loadPersonalization = () =>
   getSetting<PersonalizationSettings>('personalization', DEFAULT_PERSONALIZATION);
@@ -295,18 +361,41 @@ export async function markDemoInitialized(): Promise<void> {
   await setSetting('demoSeeded', true);
 }
 
-export async function getStorageEstimate(): Promise<{
+export const TARGET_APP_QUOTA_BYTES = 100 * 1024 * 1024 * 1024; // 100 GB
+
+export interface StorageEstimateInfo {
   usageBytes: number;
   quotaBytes: number;
-}> {
-  if (navigator.storage && navigator.storage.estimate) {
-    const est = await navigator.storage.estimate();
-    return {
-      usageBytes: est.usage || 0,
-      quotaBytes: est.quota || 0,
-    };
+  browserQuotaBytes: number;
+  targetQuotaBytes: number;
+  persisted: boolean;
+}
+
+export async function getStorageEstimate(): Promise<StorageEstimateInfo> {
+  let usageBytes = 0;
+  let browserQuotaBytes = 0;
+  let persisted = false;
+
+  try {
+    if (navigator.storage && navigator.storage.estimate) {
+      const est = await navigator.storage.estimate();
+      usageBytes = est.usage || 0;
+      browserQuotaBytes = est.quota || 0;
+    }
+    if (navigator.storage && typeof navigator.storage.persisted === 'function') {
+      persisted = await navigator.storage.persisted();
+    }
+  } catch {
+    // Non-fatal
   }
-  return { usageBytes: 0, quotaBytes: 0 };
+
+  return {
+    usageBytes,
+    quotaBytes: Math.max(browserQuotaBytes, TARGET_APP_QUOTA_BYTES),
+    browserQuotaBytes,
+    targetQuotaBytes: TARGET_APP_QUOTA_BYTES,
+    persisted,
+  };
 }
 
 export async function requestPersistentStorage(): Promise<boolean> {

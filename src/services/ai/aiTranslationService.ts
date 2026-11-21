@@ -58,7 +58,7 @@ export async function translateLyricsWithAiEngine(
 }> {
   const res = await fetch('/api/lyrics/translate', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({
       rawLyrics: opts.rawLyrics,
       trackTitle: opts.trackTitle,
@@ -70,12 +70,34 @@ export async function translateLyricsWithAiEngine(
     }),
   });
 
-  const payload = await res.json();
-  if (!res.ok) {
-    throw new Error(payload?.error || `AI 歌词翻译失败 (${res.status})`);
+  const rawText = await res.text();
+  const trimmed = rawText.trim();
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+
+  if (
+    contentType.includes('text/html') ||
+    trimmed.startsWith('<!doctype') ||
+    trimmed.startsWith('<!DOCTYPE') ||
+    trimmed.startsWith('<html') ||
+    trimmed.startsWith('<')
+  ) {
+    throw new Error('当前为纯静态部署环境，未运行后端 AI 翻译服务');
   }
 
-  return payload as {
+  let payload: Record<string, unknown> | null = null;
+  try {
+    payload = trimmed ? (JSON.parse(trimmed) as Record<string, unknown>) : null;
+  } catch {
+    throw new Error(`AI 歌词翻译响应异常 (${res.status})`);
+  }
+
+  if (!res.ok || !payload) {
+    const errMsg =
+      payload && typeof payload.error === 'string' ? payload.error : '';
+    throw new Error(errMsg || `AI 歌词翻译失败 (${res.status})`);
+  }
+
+  return payload as unknown as {
     bilingualLyrics: string;
     translatedCount: number;
     skippedReason?: string;

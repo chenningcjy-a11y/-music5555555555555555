@@ -83,7 +83,7 @@ export const LibraryPage: React.FC = () => {
 
   return (
     <div
-      className="h-full overflow-y-auto lumina-scroll px-4 sm:px-6 lg:px-10 py-6 space-y-6"
+      className="min-h-full px-4 sm:px-6 lg:px-10 py-6 pb-24 md:pb-12 space-y-6"
       onDragOver={(e) => {
         e.preventDefault();
         setDragOver(true);

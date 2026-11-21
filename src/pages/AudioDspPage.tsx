@@ -1,26 +1,62 @@
-import React from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import {
   AudioLines,
+  BookmarkPlus,
+  Check,
+  Download,
   Headphones,
   Info,
   Mic2,
   Power,
   RotateCcw,
+  Save,
   ShieldCheck,
   Sliders,
   Sparkles,
+  Trash2,
+  Upload,
 } from 'lucide-react';
 import { audioEngine } from '../audio/AudioEngine';
 import { StemSeparationPanel } from '../components/audio/StemSeparationPanel';
 import { VocalBackgroundControl } from '../components/audio/VocalBackgroundControl';
 import { useMusic } from '../context/MusicContext';
-import { EqPresetName, QualityMode } from '../types/music';
+import {
+  AUDIO_ONLY_BACKUP_OPTIONS,
+  exportLuminaBackup,
+  importLuminaBackupFiles,
+} from '../services/backupService';
+import { AudioDspSettings, EqPresetName, QualityMode } from '../types/music';
 import {
   EQ_BANDS,
   EQ_PRESETS,
   formatBitrate,
   formatSampleRate,
 } from '../utils/constants';
+
+function areAudioSettingsEqual(a: AudioDspSettings, b: AudioDspSettings): boolean {
+  return (
+    a.masterEnabled === b.masterEnabled &&
+    a.qualityMode === b.qualityMode &&
+    a.surroundEnabled === b.surroundEnabled &&
+    a.surroundWidth === b.surroundWidth &&
+    a.surroundIntensity === b.surroundIntensity &&
+    a.headphoneOptimize === b.headphoneOptimize &&
+    a.eqPreset === b.eqPreset &&
+    a.bassBoost === b.bassBoost &&
+    a.trebleBoost === b.trebleBoost &&
+    a.vocalEnhance === b.vocalEnhance &&
+    a.reverbMix === b.reverbMix &&
+    a.stereoWidth === b.stereoWidth &&
+    a.loudnessNormalization === b.loudnessNormalization &&
+    a.vocalAccompanimentBalance === b.vocalAccompanimentBalance &&
+    a.stemModeActive === b.stemModeActive &&
+    a.vocalGain === b.vocalGain &&
+    a.instrumentalGain === b.instrumentalGain &&
+    a.vocalMuted === b.vocalMuted &&
+    a.instrumentalMuted === b.instrumentalMuted &&
+    a.eqGains.every((val, idx) => val === b.eqGains[idx])
+  );
+}
 
 const QUALITY_MODES: {
   id: QualityMode;
@@ -53,11 +89,106 @@ export const AudioDspPage: React.FC = () => {
   const {
     currentTrack,
     audioSettings,
+    savedAudioPresets,
+    activeAudioPresetId,
     activePalette,
     currentTrackStemMeta,
     updateAudioSettings,
     resetAudioSettings,
+    saveNewAudioPreset,
+    overwriteAudioPreset,
+    applyAudioPreset,
+    deleteAudioPreset,
+    reloadAllLibraryData,
+    showToast,
   } = useMusic();
+
+  const [presetNameInput, setPresetNameInput] = useState('');
+  const [presetBusy, setPresetBusy] = useState(false);
+  const presetFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const activeSavedPreset = useMemo(
+    () => savedAudioPresets.find((p) => p.id === activeAudioPresetId) || null,
+    [savedAudioPresets, activeAudioPresetId]
+  );
+
+  const hasUnsavedPresetTweaks = useMemo(() => {
+    if (!activeSavedPreset) return false;
+    return !areAudioSettingsEqual(audioSettings, activeSavedPreset.settings);
+  }, [activeSavedPreset, audioSettings]);
+
+  const handleSaveAsNewPreset = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (presetBusy) return;
+    setPresetBusy(true);
+    try {
+      await saveNewAudioPreset(presetNameInput);
+      setPresetNameInput('');
+    } finally {
+      setPresetBusy(false);
+    }
+  };
+
+  const handleExportAudioPresets = async () => {
+    if (presetBusy) return;
+    setPresetBusy(true);
+    try {
+      const res = await exportLuminaBackup(AUDIO_ONLY_BACKUP_OPTIONS, {
+        mode: 'single-blob',
+      });
+      const vol = res.volumes[0];
+      if (!vol?.blob) {
+        throw new Error('生成音效预设文件失败');
+      }
+      const url = URL.createObjectURL(vol.blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = vol.filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.setTimeout(() => URL.revokeObjectURL(url), 4000);
+      showToast(
+        `已下载音效与预设文件（含当前调音及 ${savedAudioPresets.length} 套已保存预设）`
+      );
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '导出音效预设失败');
+    } finally {
+      setPresetBusy(false);
+    }
+  };
+
+  const handleImportAudioPresets = async (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setPresetBusy(true);
+    try {
+      const summary = await importLuminaBackupFiles(
+        [file],
+        AUDIO_ONLY_BACKUP_OPTIONS,
+        'merge'
+      );
+      await reloadAllLibraryData();
+      if (summary.audioPresetsRestored > 0 || summary.audioSettingsRestored) {
+        showToast(
+          `已自动导入并保存${
+            summary.audioPresetsRestored > 0
+              ? ` ${summary.audioPresetsRestored} 套音效预设与当前音效配置`
+              : '音效设置'
+          }`
+        );
+      } else {
+        showToast('该文件中未包含音质音效预设配置');
+      }
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '导入音效预设文件失败');
+    } finally {
+      setPresetBusy(false);
+    }
+  };
 
   const presetNames = Object.keys(EQ_PRESETS) as Exclude<EqPresetName, '自定义'>[];
   const isBypassed = !audioSettings.masterEnabled || audioSettings.qualityMode === 'original';
@@ -96,7 +227,15 @@ export const AudioDspPage: React.FC = () => {
     .join(' ');
 
   return (
-    <div className="h-full overflow-y-auto lumina-scroll px-4 sm:px-6 lg:px-10 py-6 space-y-6">
+    <div className="min-h-full px-4 sm:px-6 lg:px-10 py-6 pb-24 md:pb-12 space-y-6">
+      <input
+        ref={presetFileInputRef}
+        type="file"
+        accept=".json,.lumina"
+        className="hidden"
+        onChange={handleImportAudioPresets}
+      />
+
       {/* Header + Master DSP Switch */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
@@ -141,6 +280,177 @@ export const AudioDspPage: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {/* Section 0: Saved & Switchable Audio Preset Profiles */}
+      <section className="rounded-3xl bg-white/[0.045] backdrop-blur-xl border border-white/10 p-5 sm:p-6 space-y-4">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5">
+            <BookmarkPlus className="w-5 h-5 shrink-0 mt-0.5" style={{ color: activePalette.primary }} />
+            <div>
+              <h2 className="text-base font-semibold text-white">
+                我的音效方案库（随时保存并一键切换）
+              </h2>
+              <p className="text-xs text-white/60 mt-0.5">
+                {activeSavedPreset
+                  ? `当前使用方案：「${activeSavedPreset.name}」${
+                      hasUnsavedPresetTweaks ? '（已做新微调，可覆盖更新或另存为新方案）' : ' · 参数已同步'
+                    }`
+                  : '保存当前全部音质、7 段 EQ、3D 环绕与混响配置为方案，随时在多套音效间切换并随备份文件导出'}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              disabled={presetBusy}
+              onClick={handleExportAudioPresets}
+              className="px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/16 border border-white/14 text-xs font-medium text-white flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>下载音效预设文件</span>
+            </button>
+            <button
+              type="button"
+              disabled={presetBusy}
+              onClick={() => presetFileInputRef.current?.click()}
+              className="px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/16 border border-white/14 text-xs font-medium text-white flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
+            >
+              <Upload className="w-3.5 h-3.5" />
+              <span>导入预设</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Save Current Audio Profile Form */}
+        <form onSubmit={handleSaveAsNewPreset} className="flex flex-col sm:flex-row gap-2.5">
+          <input
+            type="text"
+            value={presetNameInput}
+            onChange={(e) => setPresetNameInput(e.target.value)}
+            placeholder="为当前音效命名（如：深夜人声、演唱会3D环绕、动感重低音）"
+            className="flex-1 min-w-0 px-4 py-2.5 rounded-xl bg-black/30 border border-white/14 text-sm text-white placeholder-white/40 focus:outline-none focus:border-white/35"
+          />
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {activeSavedPreset && hasUnsavedPresetTweaks && (
+              <button
+                type="button"
+                disabled={presetBusy}
+                onClick={() => overwriteAudioPreset(activeSavedPreset.id)}
+                className="px-4 py-2.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-xs font-semibold text-amber-100 flex items-center gap-1.5 transition-colors cursor-pointer"
+              >
+                <Save className="w-3.5 h-3.5" />
+                <span>更新覆盖「{activeSavedPreset.name}」</span>
+              </button>
+            )}
+            <button
+              type="submit"
+              disabled={presetBusy}
+              className="px-4 py-2.5 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 shadow-lg transition-transform active:scale-95 cursor-pointer disabled:opacity-50"
+              style={{
+                background: `linear-gradient(135deg, ${activePalette.primary}, ${activePalette.secondary})`,
+              }}
+            >
+              <BookmarkPlus className="w-3.5 h-3.5" />
+              <span>保存为新音效</span>
+            </button>
+          </div>
+        </form>
+
+        {/* Saved Presets Switcher Grid */}
+        {savedAudioPresets.length === 0 ? (
+          <div className="rounded-2xl bg-black/25 border border-white/8 px-4 py-3 text-xs text-white/55">
+            暂无已保存的音效方案。调整下方参数后点击「保存为新音效」，即可在不同风格方案之间快速切换；同时导出完整备份或配置包时也会自动打包全部方案。
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+            {savedAudioPresets.map((preset) => {
+              const isActive = activeAudioPresetId === preset.id;
+              const s = preset.settings;
+              return (
+                <div
+                  key={preset.id}
+                  className={`rounded-2xl border p-3.5 flex flex-col justify-between gap-3 transition-all ${
+                    isActive
+                      ? 'bg-white/[0.11] border-white/35 shadow-lg'
+                      : 'bg-white/[0.03] border-white/10 hover:bg-white/[0.06]'
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className="w-2 h-2 rounded-full shrink-0"
+                          style={{
+                            backgroundColor: isActive
+                              ? activePalette.primary
+                              : 'rgba(255,255,255,0.22)',
+                          }}
+                        />
+                        <h3 className="text-sm font-semibold text-white truncate">
+                          {preset.name}
+                        </h3>
+                      </div>
+                      <p className="text-[11px] text-white/60 mt-1 leading-relaxed">
+                        {s.masterEnabled
+                          ? s.qualityMode === 'original'
+                            ? '原声直通'
+                            : `${s.eqPreset} EQ`
+                          : '总开关关闭'}
+                        {' · '}低音 +{s.bassBoost}dB · 高音 +{s.trebleBoost}dB
+                        {s.vocalEnhance > 0 ? ` · 人声 +${s.vocalEnhance}dB` : ''}
+                        {s.surroundEnabled ? ` · 3D环绕 ${s.surroundIntensity}%` : ''}
+                        {s.reverbMix > 0 ? ` · 混响 ${s.reverbMix}%` : ''}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2 pt-2 border-t border-white/10">
+                    <button
+                      type="button"
+                      onClick={() => applyAudioPreset(preset.id)}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-medium flex items-center gap-1.5 cursor-pointer transition-colors ${
+                        isActive
+                          ? 'bg-white/20 text-white'
+                          : 'bg-white/10 hover:bg-white/20 text-white/90'
+                      }`}
+                    >
+                      {isActive ? (
+                        <>
+                          <Check className="w-3.5 h-3.5" style={{ color: activePalette.primary }} />
+                          <span>使用中</span>
+                        </>
+                      ) : (
+                        <span>切换到此音效</span>
+                      )}
+                    </button>
+
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => overwriteAudioPreset(preset.id)}
+                        title="用当前音效参数覆盖此方案"
+                        className="px-2.5 py-1.5 rounded-lg bg-white/8 hover:bg-white/16 text-[11px] text-white/80 cursor-pointer flex items-center gap-1"
+                      >
+                        <Save className="w-3 h-3" />
+                        <span>覆盖</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => deleteAudioPreset(preset.id)}
+                        title="删除此音效方案"
+                        className="p-1.5 rounded-lg bg-rose-500/15 hover:bg-rose-500/30 text-rose-200 cursor-pointer"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
 
       {/* Section 1: Quality Mode & Honest Source Diagnostics */}
       <section className="rounded-3xl bg-white/[0.045] backdrop-blur-xl border border-white/10 p-5 sm:p-6 space-y-5">

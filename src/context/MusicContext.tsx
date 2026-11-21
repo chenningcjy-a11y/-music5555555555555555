@@ -24,18 +24,23 @@ import {
   getTrackMvs,
   getTrackStems,
   hasInitializedDemo,
+  loadActiveAudioPresetId,
   loadAudioSettings,
   loadPendingMvTimelines,
   loadPersonalization,
   loadPlaybackPrefs,
+  loadSavedAudioPresets,
   markDemoInitialized,
   matchAndConsumePendingMvTimeline,
+  normalizeAudioSettings,
   removePendingMvTimelineById,
   requestPersistentStorage,
+  saveActiveAudioPresetId,
   saveAudioSettings,
   savePersonalization,
   savePlaybackPrefs,
   savePlaylist,
+  saveSavedAudioPresets,
   saveTrackMv,
   saveTrackWithBlob,
   setActiveTrackMv,
@@ -51,6 +56,7 @@ import {
   PersonalizationSettings,
   Playlist,
   RepeatMode,
+  SavedAudioPreset,
   SeparationEngineMode,
   TrackColorPalette,
   TrackMetadata,
@@ -187,9 +193,15 @@ interface MusicContextValue {
   removeTrackFromPlaylist: (playlistId: string, trackId: string) => Promise<void>;
   playPlaylist: (playlistId: string, startTrackId?: string) => Promise<void>;
 
-  // Settings
+  // Settings & Saved Audio Presets
+  savedAudioPresets: SavedAudioPreset[];
+  activeAudioPresetId: string | null;
   updateAudioSettings: (patch: Partial<AudioDspSettings>) => void;
   resetAudioSettings: () => void;
+  saveNewAudioPreset: (name: string) => Promise<SavedAudioPreset>;
+  overwriteAudioPreset: (id: string, name?: string) => Promise<SavedAudioPreset | null>;
+  applyAudioPreset: (id: string) => void;
+  deleteAudioPreset: (id: string) => Promise<void>;
   updatePersonalization: (patch: Partial<PersonalizationSettings>) => void;
 
   // Stem Cache & Decoupled Playback Sync (task execution lives in TaskCenterContext)
@@ -262,6 +274,8 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
   const [audioSettings, setAudioSettings] = useState<AudioDspSettings>(
     DEFAULT_AUDIO_SETTINGS
   );
+  const [savedAudioPresets, setSavedAudioPresets] = useState<SavedAudioPreset[]>([]);
+  const [activeAudioPresetId, setActiveAudioPresetId] = useState<string | null>(null);
   const [personalization, setPersonalization] = useState<PersonalizationSettings>(
     DEFAULT_PERSONALIZATION
   );
@@ -775,15 +789,24 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
   useEffect(() => {
     let cancelled = false;
     async function init() {
-      const [loadedAudio, loadedPers, loadedPrefs] = await Promise.all([
-        loadAudioSettings(),
-        loadPersonalization(),
-        loadPlaybackPrefs(),
-      ]);
+      const [loadedAudio, loadedPers, loadedPrefs, loadedPresets, loadedPresetId] =
+        await Promise.all([
+          loadAudioSettings(),
+          loadPersonalization(),
+          loadPlaybackPrefs(),
+          loadSavedAudioPresets(),
+          loadActiveAudioPresetId(),
+        ]);
       if (cancelled) return;
 
       setAudioSettings(loadedAudio);
       audioEngine.applySettings(loadedAudio);
+      setSavedAudioPresets(loadedPresets);
+      setActiveAudioPresetId(
+        loadedPresetId && loadedPresets.some((p) => p.id === loadedPresetId)
+          ? loadedPresetId
+          : null
+      );
       setPersonalization(loadedPers);
       setVolumeState(loadedPrefs.volume);
       setMuted(loadedPrefs.muted);
@@ -1687,10 +1710,10 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     [playlists, tracks, playTrackById, showToast]
   );
 
-  // Settings updates
+  // Settings updates & Saved Audio Presets
   const updateAudioSettings = useCallback((patch: Partial<AudioDspSettings>) => {
     setAudioSettings((prev) => {
-      const next = { ...prev, ...patch };
+      const next = normalizeAudioSettings({ ...prev, ...patch });
       audioEngine.applySettings(next);
       saveAudioSettings(next).catch(() => {});
       return next;
@@ -1701,8 +1724,93 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     setAudioSettings(DEFAULT_AUDIO_SETTINGS);
     audioEngine.applySettings(DEFAULT_AUDIO_SETTINGS);
     saveAudioSettings(DEFAULT_AUDIO_SETTINGS).catch(() => {});
+    setActiveAudioPresetId(null);
+    saveActiveAudioPresetId(null).catch(() => {});
     showToast('音效与均衡器已恢复默认设置');
   }, [showToast]);
+
+  const saveNewAudioPreset = useCallback(
+    async (rawName: string): Promise<SavedAudioPreset> => {
+      const cleanName =
+        rawName.trim() || `自定义音效 ${savedAudioPresets.length + 1}`;
+      const now = Date.now();
+      const id =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `dsp-${now}-${Math.random().toString(36).slice(2, 7)}`;
+      const preset: SavedAudioPreset = {
+        id,
+        name: cleanName,
+        createdAt: now,
+        updatedAt: now,
+        settings: normalizeAudioSettings(audioSettings),
+      };
+      const nextList = [preset, ...savedAudioPresets];
+      await saveSavedAudioPresets(nextList);
+      await saveActiveAudioPresetId(preset.id);
+      setSavedAudioPresets(nextList);
+      setActiveAudioPresetId(preset.id);
+      showToast(`已保存音效预设「${preset.name}」，可随时一键切换`);
+      return preset;
+    },
+    [audioSettings, savedAudioPresets, showToast]
+  );
+
+  const overwriteAudioPreset = useCallback(
+    async (id: string, name?: string): Promise<SavedAudioPreset | null> => {
+      const target = savedAudioPresets.find((p) => p.id === id);
+      if (!target) return null;
+      const now = Date.now();
+      const updated: SavedAudioPreset = {
+        ...target,
+        name: name !== undefined && name.trim() ? name.trim() : target.name,
+        updatedAt: now,
+        settings: normalizeAudioSettings(audioSettings),
+      };
+      const nextList = savedAudioPresets
+        .map((p) => (p.id === id ? updated : p))
+        .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      await saveSavedAudioPresets(nextList);
+      await saveActiveAudioPresetId(updated.id);
+      setSavedAudioPresets(nextList);
+      setActiveAudioPresetId(updated.id);
+      showToast(`已更新音效预设「${updated.name}」`);
+      return updated;
+    },
+    [audioSettings, savedAudioPresets, showToast]
+  );
+
+  const applyAudioPreset = useCallback(
+    (id: string) => {
+      const target = savedAudioPresets.find((p) => p.id === id);
+      if (!target) return;
+      const next = normalizeAudioSettings(target.settings);
+      setAudioSettings(next);
+      audioEngine.applySettings(next);
+      saveAudioSettings(next).catch(() => {});
+      setActiveAudioPresetId(target.id);
+      saveActiveAudioPresetId(target.id).catch(() => {});
+      showToast(`已切换音效预设「${target.name}」`);
+    },
+    [savedAudioPresets, showToast]
+  );
+
+  const deleteAudioPreset = useCallback(
+    async (id: string) => {
+      const target = savedAudioPresets.find((p) => p.id === id);
+      const nextList = savedAudioPresets.filter((p) => p.id !== id);
+      await saveSavedAudioPresets(nextList);
+      setSavedAudioPresets(nextList);
+      if (activeAudioPresetId === id) {
+        setActiveAudioPresetId(null);
+        await saveActiveAudioPresetId(null);
+      }
+      if (target) {
+        showToast(`已删除音效预设「${target.name}」`);
+      }
+    },
+    [activeAudioPresetId, savedAudioPresets, showToast]
+  );
 
   const updatePersonalization = useCallback(
     (patch: Partial<PersonalizationSettings>) => {
@@ -1779,6 +1887,8 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
   const reloadAllLibraryData = useCallback(async () => {
     const [
       loadedAudio,
+      loadedPresets,
+      loadedPresetId,
       loadedPers,
       loadedPrefs,
       allTracks,
@@ -1788,6 +1898,8 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       pendingMvs,
     ] = await Promise.all([
       loadAudioSettings(),
+      loadSavedAudioPresets(),
+      loadActiveAudioPresetId(),
       loadPersonalization(),
       loadPlaybackPrefs(),
       getAllTracks(),
@@ -1799,6 +1911,12 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
 
     setAudioSettings(loadedAudio);
     audioEngine.applySettings(loadedAudio);
+    setSavedAudioPresets(loadedPresets);
+    setActiveAudioPresetId(
+      loadedPresetId && loadedPresets.some((p) => p.id === loadedPresetId)
+        ? loadedPresetId
+        : null
+    );
     setPersonalization(loadedPers);
     setVolumeState(loadedPrefs.volume);
     setMuted(loadedPrefs.muted);
@@ -2663,6 +2781,12 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     playPlaylist,
     updateAudioSettings,
     resetAudioSettings,
+    savedAudioPresets,
+    activeAudioPresetId,
+    saveNewAudioPreset,
+    overwriteAudioPreset,
+    applyAudioPreset,
+    deleteAudioPreset,
     updatePersonalization,
     stemMetas,
     currentTrackStemMeta,

@@ -186,25 +186,54 @@ interface UnifiedLyricResult {
   source?: string;
 }
 
-async function fetchLrclibResults(query: string): Promise<UnifiedLyricResult[]> {
+async function fetchLrclibResults(
+  query: string,
+  title?: string,
+  artist?: string
+): Promise<UnifiedLyricResult[]> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5000);
   try {
-    const url = `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`;
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': 'LUMINA-MUSIC/1.0',
-      },
-    });
-    if (!res.ok) return [];
-    const data = (await res.json()) as UnifiedLyricResult[];
-    return data.map((item) => ({
-      ...item,
-      hasNativeTranslation: false,
-      source: 'LRCLIB',
-    }));
+    const urls: string[] = [];
+    if (title && artist) {
+      urls.push(
+        `https://lrclib.net/api/search?track_name=${encodeURIComponent(
+          title
+        )}&artist_name=${encodeURIComponent(artist)}`
+      );
+    }
+    urls.push(`https://lrclib.net/api/search?q=${encodeURIComponent(query)}`);
+
+    const settled = await Promise.allSettled(
+      urls.map(async (url) => {
+        const res = await fetch(url, {
+          signal: controller.signal,
+          headers: {
+            Accept: 'application/json',
+            'User-Agent': 'LUMINA-MUSIC/1.0',
+          },
+        });
+        if (!res.ok) return [] as UnifiedLyricResult[];
+        return (await res.json()) as UnifiedLyricResult[];
+      })
+    );
+
+    const seen = new Set<number>();
+    const out: UnifiedLyricResult[] = [];
+    for (const s of settled) {
+      if (s.status !== 'fulfilled') continue;
+      for (const item of s.value) {
+        if (!item || seen.has(item.id)) continue;
+        if (!item.syncedLyrics?.trim() && !item.plainLyrics?.trim()) continue;
+        seen.add(item.id);
+        out.push({
+          ...item,
+          hasNativeTranslation: false,
+          source: 'LRCLIB',
+        });
+      }
+    }
+    return out;
   } finally {
     clearTimeout(timer);
   }
@@ -463,6 +492,8 @@ async function startServer() {
   // Multi-source lyric search (aggregates native bilingual sources + LRCLIB)
   app.get('/api/lyrics/search', async (req, res) => {
     const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const title = typeof req.query.title === 'string' ? req.query.title.trim() : '';
+    const artist = typeof req.query.artist === 'string' ? req.query.artist.trim() : '';
     if (!q) {
       res.status(400).json({ error: '缺少搜索关键词' });
       return;
@@ -471,7 +502,7 @@ async function startServer() {
     try {
       const [neteaseSettled, lrclibSettled] = await Promise.allSettled([
         fetchNeteaseResults(q),
-        fetchLrclibResults(q),
+        fetchLrclibResults(q, title || undefined, artist || undefined),
       ]);
 
       const neteaseList =

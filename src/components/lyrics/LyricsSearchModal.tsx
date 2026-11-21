@@ -50,16 +50,19 @@ export const LyricsSearchModal: React.FC<LyricsSearchModalProps> = ({
     selectedModel,
     setSelectedModel,
     activeProvider,
+    isLoadingProviders,
     beginTask,
     finishTask,
   } = useAi();
+
+  const isStaticNoAiBackend = !isLoadingProviders && providers.length === 0;
 
   const [titleQuery, setTitleQuery] = useState('');
   const [artistQuery, setArtistQuery] = useState('');
   const [includeTranslation, setIncludeTranslation] = useState(true);
   const [targetLanguage, setTargetLanguage] = useState<LyricTargetLanguage>('zh-CN');
 
-  // 「模型翻译」选项：对应翻译没有双语的歌词
+  // 「模型翻译」选项：对应翻译没有双语的歌词；纯静态托管无后端 AI 时默认关闭以免拦截直接应用原版 LRC
   const [enableModelTranslation, setEnableModelTranslation] = useState(true);
   const [translationStyle, setTranslationStyle] =
     useState<LyricTranslationStyle>('poetic');
@@ -86,8 +89,9 @@ export const LyricsSearchModal: React.FC<LyricsSearchModalProps> = ({
       setTranslatingId(null);
       setFailedTranslationId(null);
       setTestResult(null);
+      setEnableModelTranslation(!isStaticNoAiBackend);
     }
-  }, [open, track]);
+  }, [open, track, isStaticNoAiBackend]);
 
   const availableModels = useMemo(() => {
     if (!activeProvider) return [];
@@ -456,7 +460,11 @@ export const LyricsSearchModal: React.FC<LyricsSearchModalProps> = ({
             <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-white/55 border-t border-white/6 pt-2">
               <span className="flex items-center gap-1">
                 <span className="text-rose-300/80">✦</span>
-                <span>此模型翻译对应着翻译没有双语的歌词；自带双语的歌词将直接无延迟应用。</span>
+                <span>
+                  {isStaticNoAiBackend
+                    ? '当前为纯静态部署模式：已启用前端直连 LRC 检索（如需网易云双语可联动 Netlify Functions）。'
+                    : '此模型翻译对应着翻译没有双语的歌词；自带双语的歌词将直接无延迟应用。'}
+                </span>
               </span>
 
               {testResult && (

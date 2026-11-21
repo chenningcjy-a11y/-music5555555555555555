@@ -969,7 +969,7 @@ export const PlayerPage: React.FC = () => {
 
         {/* Right Column: Glassmorphic Real-Time Synced Lyrics Panel */}
         {showLyricsInPlayer && (
-          <section className="md:col-span-6 lg:col-span-7 min-h-0 flex flex-col backdrop-blur-2xl transition-all duration-500 rounded-3xl bg-white/[0.045] border border-white/10 p-5 sm:p-7 shadow-[0_24px_70px_rgba(0,0,0,0.45)] h-[320px] md:h-[calc(100vh-140px)] max-h-[680px]">
+          <section className="md:col-span-6 lg:col-span-7 min-h-0 flex flex-col backdrop-blur-2xl transition-all duration-500 rounded-3xl bg-white/[0.045] border border-white/10 p-5 sm:p-7 shadow-[0_24px_70px_rgba(0,0,0,0.45)] h-[320px] md:h-[calc(100dvh-140px)] max-h-[680px]">
             <LyricsView
               lyricsRaw={currentTrack?.lyricsRaw}
               currentTime={currentTime}

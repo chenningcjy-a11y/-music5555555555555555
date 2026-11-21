@@ -372,7 +372,7 @@ export const MvPage: React.FC = () => {
   };
 
   return (
-    <div className="h-full w-full overflow-y-auto lumina-scroll px-4 sm:px-8 py-6 pb-24 space-y-6">
+    <div className="min-h-full w-full px-4 sm:px-8 py-6 pb-24 md:pb-12 space-y-6">
       {/* Header Row */}
       <header className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 border-b border-white/10 pb-5">
         <div className="space-y-1 min-w-0">
