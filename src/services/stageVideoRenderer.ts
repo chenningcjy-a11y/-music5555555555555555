@@ -1334,24 +1334,101 @@ async function seekVideoExact(
   });
 }
 
+type VideoElementWithRvfc = HTMLVideoElement & {
+  requestVideoFrameCallback?: (
+    callback: (
+      now: number,
+      metadata: { mediaTime: number; presentedFrames: number }
+    ) => void
+  ) => number;
+  cancelVideoFrameCallback?: (handle: number) => void;
+};
+
 /**
- * Advances an offscreen HTMLVideoElement sequentially using adaptive playbackRate (0.25x..4.0x)
- * and zero-seek pause gating rather than flushing the decoder via per-frame `.currentTime` seeks.
- * Achieves ~15x-30x faster rendering while staying tightly phase-locked to every output frame.
+ * Advances an offscreen HTMLVideoElement sequentially using adaptive playbackRate (0.25x..2.5x)
+ * and requestVideoFrameCallback presented-frame tracking so canvas.drawImage() never paints
+ * compositor-buffered frames lagging behind HTMLVideoElement.currentTime.
  */
 class SequentialMvVideoReader {
-  private videoEl: HTMLVideoElement;
+  private videoEl: VideoElementWithRvfc;
   private maxSeekableSec: number;
   private hasDoneInitialSeek = false;
   private playPromise: Promise<void> | null = null;
+  private rvfcHandle: number | null = null;
+  private hasRvfcFrameSinceSeek = false;
+  private lastRvfcMediaTime = 0;
+  private disposed = false;
+  private frameWaiters = new Set<() => void>();
 
   constructor(videoEl: HTMLVideoElement, fallbackDurSec: number) {
-    this.videoEl = videoEl;
+    this.videoEl = videoEl as VideoElementWithRvfc;
     const rawDur =
       Number.isFinite(videoEl.duration) && videoEl.duration > 0
         ? videoEl.duration
         : fallbackDurSec;
     this.maxSeekableSec = Math.max(0, rawDur - 0.02);
+    this.scheduleNextRvfc();
+  }
+
+  private scheduleNextRvfc() {
+    if (this.disposed || typeof this.videoEl.requestVideoFrameCallback !== 'function') {
+      return;
+    }
+    this.rvfcHandle = this.videoEl.requestVideoFrameCallback((_now, metadata) => {
+      if (this.disposed) return;
+      if (Number.isFinite(metadata.mediaTime)) {
+        this.lastRvfcMediaTime = metadata.mediaTime;
+        this.hasRvfcFrameSinceSeek = true;
+      }
+      if (this.frameWaiters.size > 0) {
+        const waiters = Array.from(this.frameWaiters);
+        this.frameWaiters.clear();
+        for (const w of waiters) w();
+      }
+      this.scheduleNextRvfc();
+    });
+  }
+
+  public dispose() {
+    this.disposed = true;
+    if (
+      this.rvfcHandle !== null &&
+      typeof this.videoEl.cancelVideoFrameCallback === 'function'
+    ) {
+      try {
+        this.videoEl.cancelVideoFrameCallback(this.rvfcHandle);
+      } catch {
+        // ignore
+      }
+      this.rvfcHandle = null;
+    }
+    const waiters = Array.from(this.frameWaiters);
+    this.frameWaiters.clear();
+    for (const w of waiters) w();
+  }
+
+  private getEffectiveVideoTime(): number {
+    const clockT = this.videoEl.currentTime || 0;
+    if (!this.hasRvfcFrameSinceSeek || this.videoEl.paused) {
+      return clockT;
+    }
+    // Use actual presented GPU frame timestamp when playing so compositor lag never slips through
+    return Math.min(clockT, this.lastRvfcMediaTime);
+  }
+
+  private waitForNextFrameOrTick(maxMs = 6): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        this.frameWaiters.delete(done);
+        resolve();
+      };
+      this.frameWaiters.add(done);
+      const timer = window.setTimeout(done, maxMs);
+    });
   }
 
   private safePlay() {
@@ -1378,18 +1455,17 @@ class SequentialMvVideoReader {
   private tunePlaybackRate(measuredRenderFps: number, outputFps: number, diffSec: number) {
     const baseRatio = Math.max(
       0.25,
-      Math.min(4.0, measuredRenderFps / Math.max(1, outputFps))
+      Math.min(2.2, measuredRenderFps / Math.max(1, outputFps))
     );
-    // Smooth proportional servo around target time to avoid play/pause thrashing:
-    // ahead -> decelerate gently; behind -> accelerate gently.
+    // Smooth proportional servo around target time to keep GPU texture phase-locked without deep buffering:
     let targetRate = baseRatio;
-    if (diffSec < -0.012) {
-      targetRate = baseRatio * 0.55;
-    } else if (diffSec > 0.035) {
-      targetRate = baseRatio * 1.45 + 0.25;
+    if (diffSec < -0.006) {
+      targetRate = baseRatio * 0.5;
+    } else if (diffSec > 0.025) {
+      targetRate = baseRatio * 1.35 + 0.15;
     }
-    const clampedRate = Math.max(0.25, Math.min(4.0, targetRate));
-    if (Math.abs(this.videoEl.playbackRate - clampedRate) > 0.06) {
+    const clampedRate = Math.max(0.25, Math.min(2.5, targetRate));
+    if (Math.abs(this.videoEl.playbackRate - clampedRate) > 0.05) {
       try {
         this.videoEl.playbackRate = clampedRate;
       } catch {
@@ -1410,55 +1486,63 @@ class SequentialMvVideoReader {
     if (
       this.hasDoneInitialSeek &&
       clamped >= this.maxSeekableSec - 0.002 &&
-      Math.abs((this.videoEl.currentTime || 0) - this.maxSeekableSec) < 0.05
+      Math.abs(this.getEffectiveVideoTime() - this.maxSeekableSec) < 0.05
     ) {
       this.safePause();
       return;
     }
 
-    const cur = this.videoEl.currentTime || 0;
+    const cur = this.getEffectiveVideoTime();
     const diff = clamped - cur;
 
     // 1. Initial frame OR large timeline jump (intro -> normal, mid-break jump, outro jump)
-    if (!this.hasDoneInitialSeek || diff < -0.18 || diff > 0.65) {
+    if (!this.hasDoneInitialSeek || diff < -0.15 || diff > 0.5) {
       this.safePause();
+      this.hasRvfcFrameSinceSeek = false;
       await seekVideoExact(this.videoEl, clamped);
+      this.lastRvfcMediaTime = this.videoEl.currentTime || clamped;
+      this.hasRvfcFrameSinceSeek =
+        typeof this.videoEl.requestVideoFrameCallback === 'function';
       this.hasDoneInitialSeek = true;
       return;
     }
 
-    // 2. Hard pause only if video got > 55ms ahead of target
-    if (diff < -0.055) {
+    // 2. Hard pause immediately if video got > 14ms ahead of target
+    if (diff < -0.014) {
       this.safePause();
       return;
     }
 
-    // 3. Video is already inside [-55ms .. +8ms] sync window -> zero-wait immediate frame!
-    if (diff <= 0.008 && this.videoEl.readyState >= 2) {
+    // 3. Real presented frame is already inside [-14ms .. +4ms] sync window -> zero-wait immediate frame!
+    if (diff <= 0.004 && this.videoEl.readyState >= 2) {
       this.tunePlaybackRate(measuredRenderFps, outputFps, diff);
       this.safePlay();
       return;
     }
 
-    // 4. Advance sequentially without flushing decoder keyframes
+    // 4. Advance sequentially until actual presented GPU frame catches up to target
     this.tunePlaybackRate(measuredRenderFps, outputFps, diff);
     this.safePlay();
 
-    const deadline = performance.now() + 260;
+    const deadline = performance.now() + 240;
     while (
       !isCancelled() &&
       !this.videoEl.ended &&
-      (this.videoEl.currentTime || 0) < clamped - 0.008
+      this.getEffectiveVideoTime() < clamped - 0.004
     ) {
       if (performance.now() >= deadline) {
         this.safePause();
+        this.hasRvfcFrameSinceSeek = false;
         await seekVideoExact(this.videoEl, clamped);
+        this.lastRvfcMediaTime = this.videoEl.currentTime || clamped;
+        this.hasRvfcFrameSinceSeek =
+          typeof this.videoEl.requestVideoFrameCallback === 'function';
         return;
       }
-      await new Promise<void>((r) => setTimeout(r, 2));
+      await this.waitForNextFrameOrTick(4);
     }
 
-    if ((this.videoEl.currentTime || 0) > clamped + 0.055) {
+    if (this.getEffectiveVideoTime() > clamped + 0.014) {
       this.safePause();
     }
   }
@@ -1672,6 +1756,7 @@ export function startStageVideoRender(
         let webmMuxer: WebmMuxer<WebmStreamTarget> | null = null;
         let videoEncoder: VideoEncoder | null = null;
         let audioEncoder: AudioEncoder | null = null;
+        let sequentialMvReader: SequentialMvVideoReader | null = null;
         const sink = new PagedBlobSink();
 
         try {
@@ -1773,20 +1858,45 @@ export function startStageVideoRender(
             });
           }
 
-          // Monotonic DTS + non-negative CTS guard for hardware encoders emitting B-frames under quality latencyMode
+          // Monotonic DTS + non-negative CTS guard + sample-exact audio alignment for B-frame H.264 encoders.
+          // Inspect at least 1 full GOP (fps + 2 chunks) before finalizing reorderShiftUs so mp4-muxer
+          // aligns audio start time with Video PTS[0] = reorderShiftUs (zero A/V offset without needing elst box).
           const encodedVideoInputTsQueue: number[] = [];
           const pendingVideoInitChunks: Array<{
             chunk: EncodedVideoChunk;
             meta?: EncodedVideoChunkMetadata;
             dts: number;
           }> = [];
-          const pendingAudioInitChunks: Array<{
-            chunk: EncodedAudioChunk;
-            meta?: EncodedAudioChunkMetadata;
-          }> = [];
+          const initReorderInspectCount = Math.min(totalFrames, Math.max(18, fps + 2));
           let reorderResolved = !isMp4;
+          let audioReleaseReady = !isMp4;
           let reorderShiftUs = 0;
           let lastEmittedVideoDtsUs = -1;
+
+          const AUDIO_CHUNK_SAMPLES = 2048;
+          const pendingAudioL = new Float32Array(AUDIO_CHUNK_SAMPLES);
+          const pendingAudioR = new Float32Array(AUDIO_CHUNK_SAMPLES);
+          let pendingAudioCount = 0;
+          let totalAudioSamplesEncoded = 0;
+          const queuedRawAudio: Array<{ l: Float32Array; r: Float32Array; count: number }> = [];
+
+          const encodeAudioBlockNow = (lBuf: Float32Array, rBuf: Float32Array, count: number) => {
+            if (!audioEncoder || count <= 0) return;
+            const planar = new Float32Array(count * 2);
+            planar.set(lBuf.subarray(0, count), 0);
+            planar.set(rBuf.subarray(0, count), count);
+            const audioData = new AudioData({
+              format: 'f32-planar',
+              sampleRate: 48000,
+              numberOfFrames: count,
+              numberOfChannels: 2,
+              timestamp: Math.round((totalAudioSamplesEncoded * 1_000_000) / 48000),
+              data: planar,
+            });
+            audioEncoder.encode(audioData);
+            audioData.close();
+            totalAudioSamplesEncoded += count;
+          };
 
           const flushResolvedInitialChunks = () => {
             if (reorderResolved) return;
@@ -1811,14 +1921,25 @@ export function startStageVideoRender(
             }
             pendingVideoInitChunks.length = 0;
 
-            for (const aItem of pendingAudioInitChunks) {
-              mp4Muxer?.addAudioChunk(
-                aItem.chunk,
-                aItem.meta,
-                aItem.chunk.timestamp + reorderShiftUs
-              );
+            // Prepend silent PCM matching reorderShiftUs so Audio PCM[0] lands at exact PTS = reorderShiftUs
+            // (mp4-muxer starts audio stts at t=0 without an elst box, whereas video Frame 0 sits at CTS = reorderShiftUs).
+            let leadSilenceSamples =
+              reorderShiftUs > 0 ? Math.round((reorderShiftUs * 48000) / 1_000_000) : 0;
+            if (leadSilenceSamples > 0) {
+              const zeroL = new Float32Array(AUDIO_CHUNK_SAMPLES);
+              const zeroR = new Float32Array(AUDIO_CHUNK_SAMPLES);
+              while (leadSilenceSamples > 0) {
+                const n = Math.min(AUDIO_CHUNK_SAMPLES, leadSilenceSamples);
+                encodeAudioBlockNow(zeroL, zeroR, n);
+                leadSilenceSamples -= n;
+              }
             }
-            pendingAudioInitChunks.length = 0;
+
+            audioReleaseReady = true;
+            for (const block of queuedRawAudio) {
+              encodeAudioBlockNow(block.l, block.r, block.count);
+            }
+            queuedRawAudio.length = 0;
           };
 
           videoEncoder = new VideoEncoder({
@@ -1830,7 +1951,7 @@ export function startStageVideoRender(
               const dts = encodedVideoInputTsQueue.shift() ?? chunk.timestamp;
               if (!reorderResolved) {
                 pendingVideoInitChunks.push({ chunk, meta, dts });
-                if (pendingVideoInitChunks.length >= 16) {
+                if (pendingVideoInitChunks.length >= initReorderInspectCount) {
                   flushResolvedInitialChunks();
                 }
                 return;
@@ -1856,11 +1977,7 @@ export function startStageVideoRender(
                 webmMuxer?.addAudioChunk(chunk, meta);
                 return;
               }
-              if (!reorderResolved) {
-                pendingAudioInitChunks.push({ chunk, meta });
-                return;
-              }
-              mp4Muxer?.addAudioChunk(chunk, meta, chunk.timestamp + reorderShiftUs);
+              mp4Muxer?.addAudioChunk(chunk, meta, chunk.timestamp);
             },
             error: (e) => {
               encodeError = e instanceof Error ? e : new Error(String(e));
@@ -1901,31 +2018,19 @@ export function startStageVideoRender(
               : mvL
             : null;
 
-          // Interleaved stereo audio accumulator (2048-sample chunks emitted in lockstep with video frames)
-          const AUDIO_CHUNK_SAMPLES = 2048;
-          const pendingAudioL = new Float32Array(AUDIO_CHUNK_SAMPLES);
-          const pendingAudioR = new Float32Array(AUDIO_CHUNK_SAMPLES);
-          let pendingAudioCount = 0;
-          let totalAudioSamplesEncoded = 0;
-
           const flushAudioChunk = (force = false) => {
             if (!audioEncoder || pendingAudioCount === 0) return;
             if (!force && pendingAudioCount < AUDIO_CHUNK_SAMPLES) return;
             const count = pendingAudioCount;
-            const planar = new Float32Array(count * 2);
-            planar.set(pendingAudioL.subarray(0, count), 0);
-            planar.set(pendingAudioR.subarray(0, count), count);
-            const audioData = new AudioData({
-              format: 'f32-planar',
-              sampleRate: 48000,
-              numberOfFrames: count,
-              numberOfChannels: 2,
-              timestamp: Math.round((totalAudioSamplesEncoded * 1_000_000) / 48000),
-              data: planar,
-            });
-            audioEncoder.encode(audioData);
-            audioData.close();
-            totalAudioSamplesEncoded += count;
+            if (!audioReleaseReady) {
+              queuedRawAudio.push({
+                l: pendingAudioL.slice(0, count),
+                r: pendingAudioR.slice(0, count),
+                count,
+              });
+            } else {
+              encodeAudioBlockNow(pendingAudioL, pendingAudioR, count);
+            }
             pendingAudioCount = 0;
           };
 
@@ -2022,7 +2127,7 @@ export function startStageVideoRender(
               ? `WebCodecs MP4 (高画质) · ${fps} fps`
               : `WebCodecs WebM (高画质) · ${fps} fps`;
 
-          const sequentialMvReader = mvVideoEl
+          sequentialMvReader = mvVideoEl
             ? new SequentialMvVideoReader(mvVideoEl, mvDuration)
             : null;
 
@@ -2160,6 +2265,11 @@ export function startStageVideoRender(
                 phase = 'normal';
                 curAudioTime = 0;
                 songSampleCursor = 0;
+                mvSampleCursor = Math.round(
+                  (computeSyncedMvTime(0, timeline, completedBreaks) +
+                    (timeline.syncOffsetSec || 0)) *
+                    48000
+                );
               }
             } else if (phase === 'mid-break' && activeMidBreak && mvVideoEl) {
               mvPhaseTime += dt;
@@ -2167,6 +2277,11 @@ export function startStageVideoRender(
                 completedBreaks.add(activeMidBreak.id);
                 curAudioTime = activeMidBreak.audioTriggerSec + 0.03;
                 songSampleCursor = Math.round(curAudioTime * 48000);
+                mvSampleCursor = Math.round(
+                  (computeSyncedMvTime(curAudioTime, timeline, completedBreaks) +
+                    (timeline.syncOffsetSec || 0)) *
+                    48000
+                );
                 activeMidBreak = null;
                 phase = 'normal';
               }
@@ -2267,8 +2382,9 @@ export function startStageVideoRender(
             engineLabel: `${codecSupport.container.toUpperCase()} · ${fps} fps`,
           });
 
-          await Promise.all([videoEncoder.flush(), audioEncoder.flush()]);
+          await videoEncoder.flush();
           flushResolvedInitialChunks();
+          await audioEncoder.flush();
           if (encodeError) throw encodeError;
 
           // Release heavy codec instances, audio PCM arrays, and offscreen canvases before finalizing Blob
@@ -2286,7 +2402,8 @@ export function startStageVideoRender(
           audioEncoder = null;
           encodedVideoInputTsQueue.length = 0;
           pendingVideoInitChunks.length = 0;
-          pendingAudioInitChunks.length = 0;
+          queuedRawAudio.length = 0;
+          sequentialMvReader?.dispose();
           offlineMv?.dispose();
           if (offlineMv) offlineMv.mvAudioBuffer = null;
           offlineMv = null;
@@ -2350,6 +2467,8 @@ export function startStageVideoRender(
           } catch {
             // ignore
           }
+          sequentialMvReader?.dispose();
+          sequentialMvReader = null;
           offlineMv?.dispose();
           painter.dispose();
           sink.dispose();
@@ -2734,13 +2853,78 @@ export function startStageVideoRender(
         };
       }
 
+      let pathBLastPresentedMvTime: number | null = null;
+      let pathBRvfcHandle: number | null = null;
+      const videoRvfc = videoEl as VideoElementWithRvfc | null;
+      const startPathBRvfc = () => {
+        if (!videoRvfc || typeof videoRvfc.requestVideoFrameCallback !== 'function') return;
+        pathBRvfcHandle = videoRvfc.requestVideoFrameCallback((_now, metadata) => {
+          if (finishedPathB) return;
+          if (Number.isFinite(metadata.mediaTime)) {
+            pathBLastPresentedMvTime = metadata.mediaTime;
+          }
+          startPathBRvfc();
+        });
+      };
+      let finishedPathB = false;
+      const getPathBMvTime = (): number => {
+        if (!videoEl) return 0;
+        const clockT = videoEl.currentTime || 0;
+        if (pathBLastPresentedMvTime !== null && !videoEl.paused) {
+          return Math.min(clockT, pathBLastPresentedMvTime);
+        }
+        return clockT;
+      };
+      const syncPathBVideoServo = (expectedMv: number) => {
+        if (!videoEl) return;
+        const curMv = getPathBMvTime();
+        const diff = expectedMv - curMv;
+        if (Math.abs(diff) > 0.14) {
+          try {
+            pathBLastPresentedMvTime = null;
+            videoEl.currentTime = expectedMv;
+            videoEl.playbackRate = 1;
+          } catch {
+            // ignore
+          }
+        } else if (Math.abs(diff) > 0.012) {
+          const targetRate = Math.max(0.9, Math.min(1.1, 1 + diff * 0.9));
+          if (Math.abs(videoEl.playbackRate - targetRate) > 0.005) {
+            try {
+              videoEl.playbackRate = targetRate;
+            } catch {
+              // ignore
+            }
+          }
+        } else if (Math.abs(videoEl.playbackRate - 1) > 0.005) {
+          try {
+            videoEl.playbackRate = 1;
+          } catch {
+            // ignore
+          }
+        }
+      };
+
       await new Promise<void>((resolve, reject) => {
         const frameIntervalMs = Math.max(8, Math.round(1000 / fps));
         let finished = false;
+        startPathBRvfc();
 
         const finishRecording = (wasCancelled: boolean) => {
           if (finished) return;
           finished = true;
+          finishedPathB = true;
+          if (
+            pathBRvfcHandle !== null &&
+            videoRvfc &&
+            typeof videoRvfc.cancelVideoFrameCallback === 'function'
+          ) {
+            try {
+              videoRvfc.cancelVideoFrameCallback(pathBRvfcHandle);
+            } catch {
+              // ignore
+            }
+          }
           stopSongPlayback();
           canvasStream.getTracks().forEach((t) => t.stop());
           if (wasCancelled) {
@@ -2774,33 +2958,45 @@ export function startStageVideoRender(
           let curAudioTime = getCurSongTime();
 
           if (phase === 'intro' && videoEl) {
-            mvPhaseTime += dt;
-            const probeTime = Math.max(mvPhaseTime, videoEl.currentTime || 0);
-            mvPhaseTime = probeTime;
-            if (probeTime >= timeline.introEndSec - 0.04 || videoEl.ended) {
+            const actualMv = getPathBMvTime();
+            // Lock intro progress to actual presented MV frames so song never triggers before MV arrives
+            mvPhaseTime = actualMv > 0.01 ? actualMv : Math.min(mvPhaseTime + dt, 0.08);
+            if (mvPhaseTime >= timeline.introEndSec - 0.03 || videoEl.ended) {
               phase = 'normal';
               startSongPlaybackAt(0);
               curAudioTime = getCurSongTime();
+              const expectedMv =
+                computeSyncedMvTime(curAudioTime, timeline, completedBreaks) +
+                (timeline.syncOffsetSec || 0);
+              syncPathBVideoServo(expectedMv);
             }
           } else if (phase === 'mid-break' && activeMidBreak && videoEl) {
-            mvPhaseTime += dt;
-            const probeTime = Math.max(mvPhaseTime, videoEl.currentTime || 0);
-            mvPhaseTime = probeTime;
-            if (probeTime >= activeMidBreak.mvEndSec - 0.04 || videoEl.ended) {
+            const actualMv = getPathBMvTime();
+            mvPhaseTime =
+              actualMv >= activeMidBreak.mvStartSec - 0.05
+                ? actualMv
+                : Math.min(mvPhaseTime + dt, activeMidBreak.mvStartSec + 0.08);
+            if (mvPhaseTime >= activeMidBreak.mvEndSec - 0.03 || videoEl.ended) {
               completedBreaks.add(activeMidBreak.id);
               const resumeAt = activeMidBreak.audioTriggerSec + 0.03;
               activeMidBreak = null;
               phase = 'normal';
               startSongPlaybackAt(resumeAt);
               curAudioTime = getCurSongTime();
+              const expectedMv =
+                computeSyncedMvTime(curAudioTime, timeline, completedBreaks) +
+                (timeline.syncOffsetSec || 0);
+              syncPathBVideoServo(expectedMv);
             }
           } else if (phase === 'outro' && videoEl) {
-            mvPhaseTime += dt;
-            const probeTime = Math.max(mvPhaseTime, videoEl.currentTime || 0);
-            mvPhaseTime = probeTime;
+            const actualMv = getPathBMvTime();
+            mvPhaseTime =
+              actualMv >= outroStartMvSec - 0.05
+                ? actualMv
+                : Math.min(mvPhaseTime + dt, outroStartMvSec + 0.08);
             if (
               videoEl.ended ||
-              (outroEnd > 0 && probeTime >= outroEnd - 0.04)
+              (outroEnd > 0 && mvPhaseTime >= outroEnd - 0.03)
             ) {
               finishRecording(false);
               return;
@@ -2817,6 +3013,8 @@ export function startStageVideoRender(
                 phase = 'mid-break';
                 mvPhaseTime = triggered.mvStartSec;
                 stopSongPlayback();
+                pathBLastPresentedMvTime = null;
+                videoEl.playbackRate = 1;
                 videoEl.currentTime = triggered.mvStartSec;
                 videoEl.play().catch(() => {});
               } else if (songEnded || curAudioTime >= songDuration - 0.05) {
@@ -2825,6 +3023,8 @@ export function startStageVideoRender(
                   outroStartMvSec = endSyncMv;
                   mvPhaseTime = endSyncMv;
                   stopSongPlayback();
+                  pathBLastPresentedMvTime = null;
+                  videoEl.playbackRate = 1;
                   videoEl.currentTime = endSyncMv;
                   videoEl.play().catch(() => {});
                 } else {
@@ -2835,13 +3035,7 @@ export function startStageVideoRender(
                 const expectedMv =
                   computeSyncedMvTime(curAudioTime, timeline, completedBreaks) +
                   (timeline.syncOffsetSec || 0);
-                if (Math.abs((videoEl.currentTime || 0) - expectedMv) > 0.28) {
-                  try {
-                    videoEl.currentTime = expectedMv;
-                  } catch {
-                    // ignore
-                  }
-                }
+                syncPathBVideoServo(expectedMv);
               }
             } else if (songEnded || curAudioTime >= songDuration - 0.05) {
               finishRecording(false);
