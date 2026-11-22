@@ -72,6 +72,7 @@ export async function parseAudioFileToTrack(
 
   let title = fallback.title;
   let artist = fallback.artist;
+  let composer: string | undefined;
   let album = '本地音乐';
   let duration = 0;
   let bitrate: number | undefined;
@@ -91,6 +92,10 @@ export async function parseAudioFileToTrack(
     if (common.artist && common.artist.trim()) artist = common.artist.trim();
     else if (common.albumartist && common.albumartist.trim())
       artist = common.albumartist.trim();
+    if (Array.isArray(common.composer) && common.composer.length > 0) {
+      const joined = common.composer.map((c) => c.trim()).filter(Boolean).join(' / ');
+      if (joined) composer = joined;
+    }
     if (common.album && common.album.trim()) album = common.album.trim();
 
     if (format.duration && Number.isFinite(format.duration)) {
@@ -159,6 +164,7 @@ export async function parseAudioFileToTrack(
     id: crypto.randomUUID ? crypto.randomUUID() : `trk-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     title,
     artist,
+    ...(composer ? { composer } : {}),
     album,
     duration,
     format: formatLabel,

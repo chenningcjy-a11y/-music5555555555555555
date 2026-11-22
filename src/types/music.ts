@@ -53,6 +53,7 @@ export interface TrackMetadata {
   id: string;
   title: string;
   artist: string;
+  composer?: string;
   album: string;
   duration: number; // seconds
   format: string; // MP3, FLAC, WAV, AAC, M4A, OGG, OPUS
@@ -69,6 +70,24 @@ export interface TrackMetadata {
   lyricsOffsetMs: number;
   addedAt: number;
   isDemo?: boolean;
+}
+
+export interface ArtistAvatarCandidate {
+  url: string;
+  source: string;
+  label?: string;
+}
+
+export interface ArtistAvatarRecord {
+  artistKey: string;
+  artistName: string;
+  dataUrl?: string;
+  sourceUrl?: string;
+  sourceName?: string;
+  candidates?: ArtistAvatarCandidate[];
+  fetchedAt: number;
+  notFound?: boolean;
+  isCustom?: boolean;
 }
 
 export interface Playlist {

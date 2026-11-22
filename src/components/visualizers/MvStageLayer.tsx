@@ -19,7 +19,7 @@ interface MvStageLayerProps {
   onAudioUnlockNeeded?: (needed: boolean) => void;
 }
 
-export const MvStageLayer: React.FC<MvStageLayerProps> = ({
+export const MvStageLayer: React.FC<MvStageLayerProps> = React.memo(({
   src,
   isPlaying,
   targetTime,
@@ -168,7 +168,7 @@ export const MvStageLayer: React.FC<MvStageLayerProps> = ({
       const absDiff = Math.abs(diff);
 
       if (!isPlaying) {
-        if (absDiff > 0.1) {
+        if (absDiff > 0.08) {
           try {
             video.currentTime = targetTime;
           } catch {
@@ -178,7 +178,7 @@ export const MvStageLayer: React.FC<MvStageLayerProps> = ({
         if (Math.abs(video.playbackRate - baseRate) > 0.005) {
           video.playbackRate = baseRate;
         }
-      } else if (absDiff > 0.36) {
+      } else if (absDiff > 0.25) {
         try {
           video.currentTime = targetTime;
         } catch {
@@ -187,11 +187,11 @@ export const MvStageLayer: React.FC<MvStageLayerProps> = ({
         if (Math.abs(video.playbackRate - baseRate) > 0.005) {
           video.playbackRate = baseRate;
         }
-      } else if (absDiff > 0.03) {
+      } else if (absDiff > 0.02) {
         // Gentle +/-5% speed nudge locks MV frames within ~30ms without audible pitch shift or stutter
-        const nudge = Math.max(-0.05, Math.min(0.05, diff * 0.55));
+        const nudge = Math.max(-0.05, Math.min(0.05, diff * 0.65));
         const targetRate = baseRate + nudge;
-        if (Math.abs(video.playbackRate - targetRate) > 0.004) {
+        if (Math.abs(video.playbackRate - targetRate) > 0.003) {
           video.playbackRate = targetRate;
         }
       } else if (Math.abs(video.playbackRate - baseRate) > 0.005) {
@@ -251,4 +251,4 @@ export const MvStageLayer: React.FC<MvStageLayerProps> = ({
       />
     </div>
   );
-};
+});

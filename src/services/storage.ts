@@ -1,5 +1,6 @@
 import { AiTaskRecord } from '../types/ai';
 import {
+  ArtistAvatarRecord,
   AudioDspSettings,
   PendingMvTimelineRecord,
   PersonalizationSettings,
@@ -19,7 +20,7 @@ import {
 } from '../utils/constants';
 
 const DB_NAME = 'lumina-music-db';
-const DB_VERSION = 5;
+const DB_VERSION = 6;
 
 const STORE_TRACKS = 'tracks';
 const STORE_BLOBS = 'audioBlobs';
@@ -30,6 +31,7 @@ const STORE_MODELS = 'models';
 const STORE_AI_TASKS = 'ai_tasks';
 const STORE_MVS = 'mvs';
 const STORE_MV_BLOBS = 'mvBlobs';
+const STORE_ARTIST_AVATARS = 'artistAvatars';
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -68,6 +70,9 @@ function openDatabase(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_MV_BLOBS)) {
         db.createObjectStore(STORE_MV_BLOBS);
+      }
+      if (!db.objectStoreNames.contains(STORE_ARTIST_AVATARS)) {
+        db.createObjectStore(STORE_ARTIST_AVATARS, { keyPath: 'artistKey' });
       }
     };
 
@@ -950,5 +955,53 @@ export async function matchAndConsumePendingMvTimeline(candidate: {
   await savePendingMvTimelines(remaining);
   return matched;
 }
+
+// ---------- Cached Artist / Composer Portrait Avatars ----------
+
+export async function getAllArtistAvatars(): Promise<ArtistAvatarRecord[]> {
+  try {
+    const db = await openDatabase();
+    const tx = db.transaction(STORE_ARTIST_AVATARS, 'readonly');
+    const items = await wrapRequest(tx.objectStore(STORE_ARTIST_AVATARS).getAll());
+    return items as ArtistAvatarRecord[];
+  } catch {
+    return [];
+  }
+}
+
+export async function getArtistAvatar(
+  artistKey: string
+): Promise<ArtistAvatarRecord | undefined> {
+  try {
+    const db = await openDatabase();
+    const tx = db.transaction(STORE_ARTIST_AVATARS, 'readonly');
+    return (await wrapRequest(
+      tx.objectStore(STORE_ARTIST_AVATARS).get(artistKey)
+    )) as ArtistAvatarRecord | undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function saveArtistAvatar(record: ArtistAvatarRecord): Promise<void> {
+  try {
+    const db = await openDatabase();
+    const tx = db.transaction(STORE_ARTIST_AVATARS, 'readwrite');
+    await wrapRequest(tx.objectStore(STORE_ARTIST_AVATARS).put(record));
+  } catch {
+    // Non-fatal if browser storage quota declines small portrait cache
+  }
+}
+
+export async function deleteArtistAvatar(artistKey: string): Promise<void> {
+  try {
+    const db = await openDatabase();
+    const tx = db.transaction(STORE_ARTIST_AVATARS, 'readwrite');
+    await wrapRequest(tx.objectStore(STORE_ARTIST_AVATARS).delete(artistKey));
+  } catch {
+    // Non-fatal
+  }
+}
+
 
 

@@ -160,12 +160,12 @@ export function computeTheaterVisualState(params: {
   if (phase === 'intro') {
     const endSec = timeline.introEndSec || 0;
     const remaining = Math.max(0, endSec - mvPhaseTime);
-    // Keep MV audio at full unity (1.0) right up to introEndSec so there is no dip
-    // before the equal-power overlap crossfade begins at song t=0.
     const mvAudioGain = 1;
 
-    if (safeFadeIn > 0.05 && remaining <= safeFadeIn && endSec > 0.3) {
-      const progress = Math.max(0, Math.min(1, 1 - remaining / safeFadeIn));
+    // Use safeFadeIn (or default 1.0s lead time) to fade in song UI smoothly before intro ends
+    const leadTime = Math.max(0.3, safeFadeIn);
+    if (remaining <= leadTime && endSec > 0.3) {
+      const progress = Math.max(0, Math.min(1, 1 - remaining / leadTime));
       return {
         uiOpacity: progress,
         isTheaterClarity: true,

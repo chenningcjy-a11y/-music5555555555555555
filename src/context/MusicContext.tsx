@@ -117,6 +117,21 @@ const THEME_PALETTES: Record<string, TrackColorPalette> = {
   },
 };
 
+export interface PlaybackTimeContextValue {
+  currentTime: number;
+  duration: number;
+  mvPhaseTime: number;
+  mvUiOpacity: number;
+  mvTheaterClarity: boolean;
+  mvVideoMuted: boolean;
+  mvAudioGain: number;
+  mvSkipLabel: string | null;
+  mvSkipSubLabel: string | null;
+  mvTargetTime: number;
+}
+
+const PlaybackTimeContext = createContext<PlaybackTimeContextValue | null>(null);
+
 interface MusicContextValue {
   activePage: NavPage;
   setActivePage: (p: NavPage) => void;
@@ -125,8 +140,6 @@ interface MusicContextValue {
   queueIds: string[];
   currentTrack: TrackMetadata | null;
   isPlaying: boolean;
-  currentTime: number;
-  duration: number;
   volume: number;
   muted: boolean;
   shuffle: boolean;
@@ -173,7 +186,7 @@ interface MusicContextValue {
   deleteTrack: (id: string) => Promise<void>;
   updateTrackInfo: (
     id: string,
-    patch: { title: string; artist: string; album?: string }
+    patch: { title: string; artist: string; composer?: string; album?: string }
   ) => Promise<void>;
   updateTrackCover: (id: string, imageFile: File) => Promise<void>;
   updateTrackLyrics: (id: string, lyricsRaw: string) => Promise<void>;
@@ -229,15 +242,7 @@ interface MusicContextValue {
   activeMv: TrackMvRecord | null;
   activeMvVideoUrl: string | null;
   mvPhase: MvTheaterPhase;
-  mvPhaseTime: number;
   activeMidBreak: MvMidBreakRange | null;
-  mvUiOpacity: number;
-  mvTheaterClarity: boolean;
-  mvVideoMuted: boolean;
-  mvAudioGain: number;
-  mvSkipLabel: string | null;
-  mvSkipSubLabel: string | null;
-  mvTargetTime: number;
   standaloneMvConnected: boolean;
   uploadTrackMvFile: (trackId: string, file: File) => Promise<TrackMvMeta>;
   bindTrackMvUrl: (trackId: string, url: string, title?: string) => Promise<TrackMvMeta>;
@@ -992,7 +997,10 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
         const nextMvT = mvPhaseTimeRef.current + dt;
         mvPhaseTimeRef.current = nextMvT;
         const endSec = mv.timeline.introEndSec || 0;
-        if (nextMvT >= endSec) {
+        const videoEl = document.querySelector('video') as HTMLVideoElement | null;
+        const actualVideoT = videoEl && Number.isFinite(videoEl.currentTime) ? videoEl.currentTime : nextMvT;
+        
+        if (nextMvT >= endSec || (videoEl && actualVideoT >= endSec - 0.05)) {
           introDoneForPlayRef.current = true;
           allowIntroTailCrossfadeRef.current = true;
           mvPhaseRef.current = 'normal';
@@ -1006,9 +1014,9 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
             setIsPlaying(false);
           });
           phaseTransitioned = true;
-        } else if (now - lastUiSync >= 50) {
+        } else if (now - lastUiSync >= 66) {
           lastUiSync = now;
-          setMvPhaseTime(nextMvT);
+          setMvPhaseTime(Math.max(nextMvT, actualVideoT));
         }
       } else if (phase === 'mid-break' && mv && activeMidBreakRef.current) {
         const brk = activeMidBreakRef.current;
@@ -1029,7 +1037,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
             setIsPlaying(false);
           });
           phaseTransitioned = true;
-        } else if (now - lastUiSync >= 50) {
+        } else if (now - lastUiSync >= 66) {
           lastUiSync = now;
           setMvPhaseTime(nextMvT);
         }
@@ -1043,7 +1051,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
           playNext(false);
           return;
         }
-        if (now - lastUiSync >= 50) {
+        if (now - lastUiSync >= 66) {
           lastUiSync = now;
           setMvPhaseTime(nextMvT);
         }
@@ -1090,17 +1098,17 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
         });
         audioEngine.setTheaterMixGains(vis.songAudioGain, vis.mvAudioGain, 0.015);
 
-        // During crossfade overlaps in normal phase, update React currentTime smoothly (~25fps)
+        // During crossfade overlaps in normal phase, update React currentTime smoothly (~16fps)
         // instead of waiting 250ms for HTMLAudioElement timeupdate
         const inCrossfade =
           mvPhaseRef.current === 'normal' &&
           vis.mvAudioGain > 0.002 &&
           vis.songAudioGain < 0.998;
-        if (inCrossfade && now - lastCrossfadeUiSync >= 38) {
+        if (inCrossfade && now - lastCrossfadeUiSync >= 60) {
           lastCrossfadeUiSync = now;
           setCurrentTime(liveAudioT);
         }
-        if (phaseTransitioned || (inCrossfade && now - lastLiveSnapAtRef.current >= 38)) {
+        if (phaseTransitioned || (inCrossfade && now - lastLiveSnapAtRef.current >= 60)) {
           lastLiveSnapAtRef.current = now;
           publishMvSyncSnapshotRef.current?.();
         }
@@ -1484,23 +1492,26 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
   const updateTrackInfo = useCallback(
     async (
       id: string,
-      patch: { title: string; artist: string; album?: string }
+      patch: { title: string; artist: string; composer?: string; album?: string }
     ) => {
       const target = stateRef.current.tracks.find((t) => t.id === id);
       if (!target) return;
       const nextTitle = patch.title.trim() || target.title;
       const nextArtist = patch.artist.trim() || '未知艺术家';
+      const nextComposer =
+        patch.composer !== undefined ? patch.composer.trim() || undefined : target.composer;
       const nextAlbum =
         patch.album !== undefined ? patch.album.trim() || '本地音乐' : target.album;
       const updated: TrackMetadata = {
         ...target,
         title: nextTitle,
         artist: nextArtist,
+        composer: nextComposer,
         album: nextAlbum,
       };
       await updateTrackMetadata(updated);
       setTracks((prev) => prev.map((t) => (t.id === id ? updated : t)));
-      showToast('已更新歌曲名称与人物信息');
+      showToast('已更新歌曲信息与分类元数据');
     },
     [showToast]
   );
@@ -2633,10 +2644,16 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
         }
       }
     }
-    try {
-      localStorage.setItem(MV_SYNC_STORAGE_KEY, JSON.stringify(snap));
-    } catch {
-      // ignore storage errors
+    if (
+      standaloneWindowsRef.current.size > 0 ||
+      standaloneHeartbeatAtRef.current > 0 ||
+      !isPlayingRef.current
+    ) {
+      try {
+        localStorage.setItem(MV_SYNC_STORAGE_KEY, JSON.stringify(snap));
+      } catch {
+        // ignore storage errors
+      }
     }
   }, []);
   publishMvSyncSnapshotRef.current = publishMvSyncSnapshot;
@@ -2775,10 +2792,10 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     };
   }, [publishMvSyncSnapshot]);
 
-  // Publish immediately on important state changes and at 150ms cadence while playing or standalone connected
+  // Publish immediately on important state changes and at 85ms cadence only when standalone MV window is connected
   useEffect(() => {
     publishMvSyncSnapshot();
-    if (!isPlaying && !standaloneMvConnected) return;
+    if (!standaloneMvConnected) return;
     const timer = window.setInterval(() => {
       publishMvSyncSnapshot();
     }, 85);
@@ -2794,119 +2811,243 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     publishMvSyncSnapshot,
   ]);
 
-  const value: MusicContextValue = {
-    activePage,
-    setActivePage,
-    tracks,
-    playlists,
-    queueIds,
-    currentTrack,
-    isPlaying,
-    currentTime,
-    duration,
-    volume,
-    muted,
-    shuffle,
-    shufflePlayedIds,
-    repeat,
-    isQueueOpen,
-    setIsQueueOpen,
-    showLyricsInPlayer,
-    setShowLyricsInPlayer,
-    isFullscreen,
-    isBrowserFullscreen,
-    toggleFullscreen,
-    exitFullscreen,
-    enterBrowserFullscreen,
-    exitBrowserFullscreen,
-    toggleBrowserFullscreen,
-    audioSettings,
-    personalization,
-    activePalette,
-    isImporting,
-    importProgress,
-    toastMessage,
-    showToast,
-    playTrackById,
-    togglePlayPause,
-    playNext,
-    playPrev,
-    seekTo,
-    setVolume,
-    toggleMute,
-    toggleShuffle,
-    cycleRepeat,
-    enqueueTrack,
-    removeFromQueue,
-    clearQueue,
-    importLocalFiles,
-    toggleFavorite,
-    deleteTrack,
-    updateTrackInfo,
-    updateTrackCover,
-    updateTrackLyrics,
-    translateTrackLyrics,
-    isTranslatingLyrics,
-    updateLyricsOffset,
-    loadDemoLibrary,
-    resetLibrary,
-    createPlaylist,
-    renamePlaylist,
-    deletePlaylist,
-    addTrackToPlaylist,
-    removeTrackFromPlaylist,
-    playPlaylist,
-    updateAudioSettings,
-    resetAudioSettings,
-    savedAudioPresets,
-    activeAudioPresetId,
-    saveNewAudioPreset,
-    overwriteAudioPreset,
-    applyAudioPreset,
-    deleteAudioPreset,
-    updatePersonalization,
-    stemMetas,
-    currentTrackStemMeta,
-    separationEngineMode,
-    setSeparationEngineMode,
-    refreshStemMetas,
-    importTrackAndStemsToPlayer,
-    pauseMainPlayer,
-    removeTrackStems,
-    reloadAllLibraryData,
-    trackMvs,
-    allMvCountByTrack,
-    pendingMvTimelines,
-    activeMv,
-    activeMvVideoUrl,
-    mvPhase,
-    mvPhaseTime,
-    activeMidBreak,
-    mvUiOpacity: mvTheaterVisual.uiOpacity,
-    mvTheaterClarity: mvTheaterVisual.isTheaterClarity,
-    mvVideoMuted,
-    mvAudioGain: mvTheaterVisual.mvAudioGain,
-    mvSkipLabel: mvTheaterVisual.skipLabel,
-    mvSkipSubLabel: mvTheaterVisual.skipSubLabel,
-    mvTargetTime,
-    standaloneMvConnected,
-    uploadTrackMvFile,
-    bindTrackMvUrl,
-    selectActiveTrackMv,
-    updateTrackMvConfig,
-    deleteTrackMv,
-    refreshPendingMvTimelines,
-    removePendingMvTimeline,
-    skipMvPhase,
-    restartTrackWithMvIntro,
-    seekMvTimeline,
-  };
+  const playbackTimeValue = useMemo<PlaybackTimeContextValue>(
+    () => ({
+      currentTime,
+      duration,
+      mvPhaseTime,
+      mvUiOpacity: mvTheaterVisual.uiOpacity,
+      mvTheaterClarity: mvTheaterVisual.isTheaterClarity,
+      mvVideoMuted,
+      mvAudioGain: mvTheaterVisual.mvAudioGain,
+      mvSkipLabel: mvTheaterVisual.skipLabel,
+      mvSkipSubLabel: mvTheaterVisual.skipSubLabel,
+      mvTargetTime,
+    }),
+    [
+      currentTime,
+      duration,
+      mvPhaseTime,
+      mvTheaterVisual.uiOpacity,
+      mvTheaterVisual.isTheaterClarity,
+      mvVideoMuted,
+      mvTheaterVisual.mvAudioGain,
+      mvTheaterVisual.skipLabel,
+      mvTheaterVisual.skipSubLabel,
+      mvTargetTime,
+    ]
+  );
 
-  return <MusicContext.Provider value={value}>{children}</MusicContext.Provider>;
+  const value = useMemo<MusicContextValue>(
+    () => ({
+      activePage,
+      setActivePage,
+      tracks,
+      playlists,
+      queueIds,
+      currentTrack,
+      isPlaying,
+      volume,
+      muted,
+      shuffle,
+      shufflePlayedIds,
+      repeat,
+      isQueueOpen,
+      setIsQueueOpen,
+      showLyricsInPlayer,
+      setShowLyricsInPlayer,
+      isFullscreen,
+      isBrowserFullscreen,
+      toggleFullscreen,
+      exitFullscreen,
+      enterBrowserFullscreen,
+      exitBrowserFullscreen,
+      toggleBrowserFullscreen,
+      audioSettings,
+      personalization,
+      activePalette,
+      isImporting,
+      importProgress,
+      toastMessage,
+      showToast,
+      playTrackById,
+      togglePlayPause,
+      playNext,
+      playPrev,
+      seekTo,
+      setVolume,
+      toggleMute,
+      toggleShuffle,
+      cycleRepeat,
+      enqueueTrack,
+      removeFromQueue,
+      clearQueue,
+      importLocalFiles,
+      toggleFavorite,
+      deleteTrack,
+      updateTrackInfo,
+      updateTrackCover,
+      updateTrackLyrics,
+      translateTrackLyrics,
+      isTranslatingLyrics,
+      updateLyricsOffset,
+      loadDemoLibrary,
+      resetLibrary,
+      createPlaylist,
+      renamePlaylist,
+      deletePlaylist,
+      addTrackToPlaylist,
+      removeTrackFromPlaylist,
+      playPlaylist,
+      updateAudioSettings,
+      resetAudioSettings,
+      savedAudioPresets,
+      activeAudioPresetId,
+      saveNewAudioPreset,
+      overwriteAudioPreset,
+      applyAudioPreset,
+      deleteAudioPreset,
+      updatePersonalization,
+      stemMetas,
+      currentTrackStemMeta,
+      separationEngineMode,
+      setSeparationEngineMode,
+      refreshStemMetas,
+      importTrackAndStemsToPlayer,
+      pauseMainPlayer,
+      removeTrackStems,
+      reloadAllLibraryData,
+      trackMvs,
+      allMvCountByTrack,
+      pendingMvTimelines,
+      activeMv,
+      activeMvVideoUrl,
+      mvPhase,
+      activeMidBreak,
+      standaloneMvConnected,
+      uploadTrackMvFile,
+      bindTrackMvUrl,
+      selectActiveTrackMv,
+      updateTrackMvConfig,
+      deleteTrackMv,
+      refreshPendingMvTimelines,
+      removePendingMvTimeline,
+      skipMvPhase,
+      restartTrackWithMvIntro,
+      seekMvTimeline,
+    }),
+    [
+      activePage,
+      tracks,
+      playlists,
+      queueIds,
+      currentTrack,
+      isPlaying,
+      volume,
+      muted,
+      shuffle,
+      shufflePlayedIds,
+      repeat,
+      isQueueOpen,
+      showLyricsInPlayer,
+      isFullscreen,
+      isBrowserFullscreen,
+      toggleFullscreen,
+      exitFullscreen,
+      enterBrowserFullscreen,
+      exitBrowserFullscreen,
+      toggleBrowserFullscreen,
+      audioSettings,
+      personalization,
+      activePalette,
+      isImporting,
+      importProgress,
+      toastMessage,
+      showToast,
+      playTrackById,
+      togglePlayPause,
+      playNext,
+      playPrev,
+      seekTo,
+      setVolume,
+      toggleMute,
+      toggleShuffle,
+      cycleRepeat,
+      enqueueTrack,
+      removeFromQueue,
+      clearQueue,
+      importLocalFiles,
+      toggleFavorite,
+      deleteTrack,
+      updateTrackInfo,
+      updateTrackCover,
+      updateTrackLyrics,
+      translateTrackLyrics,
+      isTranslatingLyrics,
+      updateLyricsOffset,
+      loadDemoLibrary,
+      resetLibrary,
+      createPlaylist,
+      renamePlaylist,
+      deletePlaylist,
+      addTrackToPlaylist,
+      removeTrackFromPlaylist,
+      playPlaylist,
+      updateAudioSettings,
+      resetAudioSettings,
+      savedAudioPresets,
+      activeAudioPresetId,
+      saveNewAudioPreset,
+      overwriteAudioPreset,
+      applyAudioPreset,
+      deleteAudioPreset,
+      updatePersonalization,
+      stemMetas,
+      currentTrackStemMeta,
+      separationEngineMode,
+      refreshStemMetas,
+      importTrackAndStemsToPlayer,
+      pauseMainPlayer,
+      removeTrackStems,
+      reloadAllLibraryData,
+      trackMvs,
+      allMvCountByTrack,
+      pendingMvTimelines,
+      activeMv,
+      activeMvVideoUrl,
+      mvPhase,
+      activeMidBreak,
+      standaloneMvConnected,
+      uploadTrackMvFile,
+      bindTrackMvUrl,
+      selectActiveTrackMv,
+      updateTrackMvConfig,
+      deleteTrackMv,
+      refreshPendingMvTimelines,
+      removePendingMvTimeline,
+      skipMvPhase,
+      restartTrackWithMvIntro,
+      seekMvTimeline,
+    ]
+  );
+
+  return (
+    <MusicContext.Provider value={value}>
+      <PlaybackTimeContext.Provider value={playbackTimeValue}>
+        {children}
+      </PlaybackTimeContext.Provider>
+    </MusicContext.Provider>
+  );
 };
 
 export function useMusic(): MusicContextValue {
   const ctx = useContext(MusicContext);
   if (!ctx) throw new Error('useMusic must be used within MusicProvider');
+  return ctx;
+}
+
+export function usePlaybackTime(): PlaybackTimeContextValue {
+  const ctx = useContext(PlaybackTimeContext);
+  if (!ctx) throw new Error('usePlaybackTime must be used within MusicProvider');
   return ctx;
 }

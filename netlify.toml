@@ -10,6 +10,12 @@
   force = true
 
 [[redirects]]
+  from = "/api/artist-avatar"
+  to = "/.netlify/functions/artist-avatar"
+  status = 200
+  force = true
+
+[[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200

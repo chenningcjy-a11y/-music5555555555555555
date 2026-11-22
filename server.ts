@@ -9,6 +9,10 @@ import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { createAiRouter } from './server/ai/taskRoutes.ts';
 import { getStoredProviderWithKey } from './server/ai/keyVault.ts';
 import {
+  downloadRemoteImageAsDataUrl,
+  searchArtistAvatarPortraits,
+} from './server/artistAvatarSearch.ts';
+import {
   callProviderTextCompletion,
   extractJsonFromLlmText,
 } from './server/ai/providerClient.ts';
@@ -522,6 +526,45 @@ async function startServer() {
     } catch (err) {
       res.status(502).json({
         error: err instanceof Error ? err.message : '歌词检索服务暂时不可用',
+      });
+    }
+  });
+
+  // Web artist portrait search & safe server-side auto-download proxy
+  app.get('/api/artist-avatar', async (req, res) => {
+    const mode = typeof req.query.mode === 'string' ? req.query.mode.trim() : '';
+    if (mode === 'download') {
+      const targetUrl =
+        typeof req.query.url === 'string' ? req.query.url.trim() : '';
+      if (!targetUrl) {
+        res.status(400).json({ ok: false, error: '缺少图像地址' });
+        return;
+      }
+      const downloadedDataUrl = await downloadRemoteImageAsDataUrl(targetUrl);
+      if (!downloadedDataUrl) {
+        res.status(422).json({ ok: false, error: '下载图像失败或地址受限' });
+        return;
+      }
+      res.json({ ok: true, downloadedDataUrl, sourceUrl: targetUrl });
+      return;
+    }
+
+    const name = typeof req.query.name === 'string' ? req.query.name.trim() : '';
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const auto = req.query.auto !== '0';
+
+    try {
+      const result = await searchArtistAvatarPortraits({
+        name: name || q,
+        customQuery: q || undefined,
+        autoDownload: auto,
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(502).json({
+        ok: false,
+        candidates: [],
+        error: err instanceof Error ? err.message : '歌手头像搜索引擎暂时不可用',
       });
     }
   });

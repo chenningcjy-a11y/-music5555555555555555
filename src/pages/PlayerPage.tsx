@@ -1,5 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  Download,
   ExternalLink,
   FileMusic,
   Film,
@@ -9,8 +10,6 @@ import {
   MessageSquareText,
   Mic2,
   Minimize2,
-  Monitor,
-  MonitorOff,
   Pause,
   Pencil,
   Play,
@@ -24,6 +23,7 @@ import {
   X,
 } from 'lucide-react';
 import { TrackInfoEditModal } from '../components/TrackInfoEditModal';
+import { TrackPackageExportModal } from '../components/export/TrackPackageExportModal';
 import { VocalBackgroundControl } from '../components/audio/VocalBackgroundControl';
 import { FullscreenThreeLineLyrics } from '../components/lyrics/FullscreenThreeLineLyrics';
 import { LyricsEditorModal } from '../components/lyrics/LyricsEditorModal';
@@ -33,7 +33,7 @@ import { AlbumVinylStage } from '../components/visualizers/AlbumVinylStage';
 import { FullscreenCoverFluidStage } from '../components/visualizers/FullscreenCoverFluidStage';
 import { LiquidWaveCanvas } from '../components/visualizers/LiquidWaveCanvas';
 import { MvStageLayer } from '../components/visualizers/MvStageLayer';
-import { useMusic } from '../context/MusicContext';
+import { useMusic, usePlaybackTime } from '../context/MusicContext';
 import {
   formatBitrate,
   formatSampleRate,
@@ -44,8 +44,6 @@ export const PlayerPage: React.FC = () => {
   const {
     currentTrack,
     isPlaying,
-    currentTime,
-    duration,
     volume,
     muted,
     shuffle,
@@ -53,10 +51,8 @@ export const PlayerPage: React.FC = () => {
     showLyricsInPlayer,
     setShowLyricsInPlayer,
     isFullscreen,
-    isBrowserFullscreen,
     toggleFullscreen,
     exitFullscreen,
-    toggleBrowserFullscreen,
     setIsQueueOpen,
     setActivePage,
     activePalette,
@@ -83,6 +79,14 @@ export const PlayerPage: React.FC = () => {
     activeMv,
     activeMvVideoUrl,
     mvPhase,
+    standaloneMvConnected,
+    skipMvPhase,
+    seekMvTimeline,
+  } = useMusic();
+
+  const {
+    currentTime,
+    duration,
     mvPhaseTime,
     mvUiOpacity,
     mvVideoMuted,
@@ -90,15 +94,23 @@ export const PlayerPage: React.FC = () => {
     mvSkipLabel,
     mvSkipSubLabel,
     mvTargetTime,
-    standaloneMvConnected,
-    skipMvPhase,
-    seekMvTimeline,
-  } = useMusic();
+  } = usePlaybackTime();
+
+  const currentTrackId = currentTrack?.id;
+  const handleChangeCover = useCallback(
+    (file: File) => {
+      if (currentTrackId) {
+        void updateTrackCover(currentTrackId, file);
+      }
+    },
+    [currentTrackId, updateTrackCover]
+  );
 
   const [searchOpen, setSearchOpen] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
   const [trackInfoEditOpen, setTrackInfoEditOpen] = useState(false);
   const [vocalMixerOpen, setVocalMixerOpen] = useState(false);
+  const [exportModalOpen, setExportModalOpen] = useState(false);
   const [showExitHint, setShowExitHint] = useState(false);
   const [showMvSkipOnTap, setShowMvSkipOnTap] = useState(false);
   const [scrubProgress, setScrubProgress] = useState<number | null>(null);
@@ -482,43 +494,12 @@ export const PlayerPage: React.FC = () => {
         </div>
       )}
 
-      {/* Homepage Browser-Level Fullscreen Control (hides browser tabs/URL bar while preserving full webpage & feature fullscreen) */}
-      <div className="absolute top-3 right-4 sm:right-6 z-20 flex items-center gap-2">
-        <button
-          type="button"
-          onClick={toggleBrowserFullscreen}
-          title={
-            isBrowserFullscreen
-              ? '退出浏览器全屏（恢复浏览器顶部标签与地址栏）'
-              : '浏览器全屏显示：隐藏浏览器顶部标签与地址栏，保留网页与全屏展示入口'
-          }
-          aria-label={isBrowserFullscreen ? '退出浏览器全屏' : '浏览器全屏显示'}
-          className={`min-h-[38px] px-3 py-1.5 rounded-xl backdrop-blur-xl border text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer shadow-lg ${
-            isBrowserFullscreen
-              ? 'bg-rose-500/20 hover:bg-rose-500/30 border-rose-400/35 text-rose-100'
-              : 'bg-white/[0.07] hover:bg-white/[0.14] border-white/12 text-white/80 hover:text-white'
-          }`}
-        >
-          {isBrowserFullscreen ? (
-            <>
-              <MonitorOff className="w-3.5 h-3.5 text-rose-300 shrink-0" />
-              <span>退出浏览器全屏</span>
-            </>
-          ) : (
-            <>
-              <Monitor className="w-3.5 h-3.5 shrink-0" />
-              <span>浏览器全屏</span>
-            </>
-          )}
-        </button>
-      </div>
-
       {/* Main dual-column workspace */}
       <div
         className={`relative z-10 flex-1 min-h-0 w-full mx-auto grid items-center ${
           showLyricsInPlayer
-            ? 'px-4 sm:px-6 lg:px-10 pt-11 sm:pt-12 pb-20 sm:pb-24 grid-cols-1 md:grid-cols-12 gap-6 lg:gap-10'
-            : 'max-w-2xl px-4 sm:px-6 lg:px-10 pt-11 sm:pt-12 pb-20 sm:pb-24 grid-cols-1 gap-6 lg:gap-10'
+            ? 'px-4 sm:px-6 lg:px-10 pt-3 sm:pt-5 pb-20 sm:pb-24 grid-cols-1 md:grid-cols-12 gap-6 lg:gap-10'
+            : 'max-w-2xl px-4 sm:px-6 lg:px-10 pt-3 sm:pt-5 pb-20 sm:pb-24 grid-cols-1 gap-6 lg:gap-10'
         }`}
       >
         {/* Left Column: Vinyl Stage + Track Info + Transport Controls */}
@@ -536,11 +517,7 @@ export const PlayerPage: React.FC = () => {
             palette={activePalette}
             animationIntensity={personalization.animationIntensity}
             fullscreen={false}
-            onChangeCover={
-              currentTrack
-                ? (file) => updateTrackCover(currentTrack.id, file)
-                : undefined
-            }
+            onChangeCover={currentTrack ? handleChangeCover : undefined}
           />
 
           {/* Track Identity & Genuine Technical Metadata */}
@@ -852,6 +829,18 @@ export const PlayerPage: React.FC = () => {
                       <Film className="w-[18px] h-[18px]" />
                     </button>
 
+                    {currentTrack && (
+                      <button
+                        type="button"
+                        onClick={() => setExportModalOpen(true)}
+                        title="一键导出同款播放视频与完整歌曲文件夹"
+                        aria-label="一键导出同款播放视频与完整歌曲文件夹"
+                        className="min-w-[40px] min-h-[40px] flex items-center justify-center rounded-xl text-white/75 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+                      >
+                        <Download className="w-[18px] h-[18px]" />
+                      </button>
+                    )}
+
                     <button
                       type="button"
                       onClick={toggleFullscreen}
@@ -1004,7 +993,10 @@ export const PlayerPage: React.FC = () => {
 
         {/* Right Column: Glassmorphic Real-Time Synced Lyrics Panel */}
         {showLyricsInPlayer && (
-          <section className="md:col-span-6 lg:col-span-7 min-h-0 flex flex-col backdrop-blur-2xl transition-all duration-500 rounded-3xl bg-white/[0.045] border border-white/10 p-5 sm:p-7 shadow-[0_24px_70px_rgba(0,0,0,0.45)] h-[320px] md:h-[calc(100dvh-160px)] max-h-[680px]">
+          <section
+            className="md:col-span-6 lg:col-span-7 min-h-0 flex flex-col backdrop-blur-2xl rounded-3xl bg-white/[0.045] border border-white/10 p-5 sm:p-7 shadow-[0_24px_70px_rgba(0,0,0,0.45)] h-[320px] md:h-[calc(100dvh-140px)] max-h-[680px]"
+            style={{ transform: 'translateZ(0)', contain: 'layout style paint' }}
+          >
             <LyricsView
               lyricsRaw={currentTrack?.lyricsRaw}
               currentTime={currentTime}
@@ -1033,7 +1025,7 @@ export const PlayerPage: React.FC = () => {
       </div>
 
       {/* Bottom Full-Width Liquid Wave Visualizer */}
-      <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-0 overflow-hidden transition-all duration-500 h-24 sm:h-32">
+      <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-0 overflow-hidden h-24 sm:h-32">
         <LiquidWaveCanvas
           isPlaying={isPlaying}
           palette={activePalette}
@@ -1069,6 +1061,12 @@ export const PlayerPage: React.FC = () => {
         palette={activePalette}
         onClose={() => setTrackInfoEditOpen(false)}
         onSave={updateTrackInfo}
+      />
+
+      <TrackPackageExportModal
+        open={exportModalOpen}
+        track={currentTrack}
+        onClose={() => setExportModalOpen(false)}
       />
     </div>
   );

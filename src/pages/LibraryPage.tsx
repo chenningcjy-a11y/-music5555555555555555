@@ -1,5 +1,6 @@
-import React, { useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import {
+  Download,
   FolderPlus,
   Heart,
   ImagePlus,
@@ -14,7 +15,11 @@ import {
   Upload,
 } from 'lucide-react';
 import { TrackInfoEditModal } from '../components/TrackInfoEditModal';
+import { TrackPackageExportModal } from '../components/export/TrackPackageExportModal';
+import { ArtistClassificationPanel } from '../components/library/ArtistClassificationPanel';
 import { useMusic } from '../context/MusicContext';
+import { TrackMetadata } from '../types/music';
+import { buildArtistPartitionGroups } from '../utils/artistGrouping';
 import {
   formatBitrate,
   formatFileSize,
@@ -49,14 +54,25 @@ export const LibraryPage: React.FC = () => {
   const coverInputRef = useRef<HTMLInputElement | null>(null);
   const [coverTargetTrackId, setCoverTargetTrackId] = useState<string | null>(null);
   const [editingTrackId, setEditingTrackId] = useState<string | null>(null);
+  const [exportingTrackId, setExportingTrackId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const [filterMode, setFilterMode] = useState<'all' | 'favorites'>('all');
+  const [filterMode, setFilterMode] = useState<'all' | 'favorites' | 'artists'>('all');
   const [dragOver, setDragOver] = useState(false);
   const [playlistMenuTrackId, setPlaylistMenuTrackId] = useState<string | null>(null);
 
   const editingTrack = useMemo(
     () => tracks.find((t) => t.id === editingTrackId) || null,
     [tracks, editingTrackId]
+  );
+
+  const exportingTrack = useMemo(
+    () => tracks.find((t) => t.id === exportingTrackId) || null,
+    [tracks, exportingTrackId]
+  );
+
+  const artistCategoryCount = useMemo(
+    () => buildArtistPartitionGroups(tracks, 'artist').length,
+    [tracks]
   );
 
   const filteredTracks = useMemo(() => {
@@ -67,11 +83,24 @@ export const LibraryPage: React.FC = () => {
       return (
         t.title.toLowerCase().includes(q) ||
         t.artist.toLowerCase().includes(q) ||
+        (t.composer || '').toLowerCase().includes(q) ||
         t.album.toLowerCase().includes(q) ||
         t.format.toLowerCase().includes(q)
       );
     });
   }, [tracks, searchQuery, filterMode]);
+
+  const handlePlayGroupTracks = useCallback(
+    async (groupTracks: TrackMetadata[]) => {
+      if (groupTracks.length === 0) return;
+      await playTrackById(
+        groupTracks[0].id,
+        groupTracks.map((t) => t.id)
+      );
+      setActivePage('player');
+    },
+    [playTrackById, setActivePage]
+  );
 
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
@@ -223,12 +252,12 @@ export const LibraryPage: React.FC = () => {
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="搜索歌曲、艺术家、专辑或格式..."
+            placeholder="搜索歌曲、歌手、作曲家、专辑或格式..."
             className="w-full pl-10 pr-4 py-2.5 rounded-xl bg-white/[0.06] border border-white/12 text-sm text-white placeholder-white/40 focus:outline-none focus:border-white/30"
           />
         </div>
 
-        <div className="flex items-center gap-1 p-1 rounded-xl bg-white/[0.06] border border-white/10 self-start">
+        <div className="flex items-center gap-1 p-1 rounded-xl bg-white/[0.06] border border-white/10 self-start flex-wrap">
           <button
             type="button"
             onClick={() => setFilterMode('all')}
@@ -251,44 +280,60 @@ export const LibraryPage: React.FC = () => {
           >
             我的收藏 ({tracks.filter((t) => t.favorite).length})
           </button>
+          <button
+            type="button"
+            onClick={() => setFilterMode('artists')}
+            className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
+              filterMode === 'artists'
+                ? 'bg-white/16 text-white'
+                : 'text-white/60 hover:text-white'
+            }`}
+          >
+            歌手分类 ({artistCategoryCount})
+          </button>
         </div>
       </div>
 
-      {/* Track List */}
-      {filteredTracks.length === 0 ? (
-        <div className="rounded-3xl bg-white/[0.03] border border-white/10 p-12 text-center flex flex-col items-center gap-3">
-          <Music2 className="w-10 h-10 text-white/35" />
-          <p className="text-sm text-white/75">
-            {searchQuery
-              ? '未找到匹配的歌曲'
-              : filterMode === 'favorites'
-              ? '暂无收藏的歌曲'
-              : '曲库还是空的，快导入本地音乐吧'}
-          </p>
-        </div>
-      ) : (
-        <div className="rounded-3xl bg-white/[0.04] backdrop-blur-xl border border-white/10 divide-y divide-white/[0.06] overflow-visible">
-          {filteredTracks.map((track) => {
-            const active = currentTrack?.id === track.id;
+      {/* Main Content: Artist/Composer Square Partition View OR Flat Track List */}
+      {(() => {
+        const renderTrackRows = (listTracks: TrackMetadata[]) => {
+          if (listTracks.length === 0) {
             return (
-              <div
-                key={track.id}
-                className={`relative flex items-center gap-3 sm:gap-4 px-3.5 sm:px-5 py-3 transition-colors ${
-                  active ? 'bg-white/[0.09]' : 'hover:bg-white/[0.05]'
-                }`}
-              >
-                {/* Cover Thumbnail */}
-                <button
-                  type="button"
-                  onClick={async () => {
-                    await playTrackById(
-                      track.id,
-                      filteredTracks.map((t) => t.id)
-                    );
-                    setActivePage('player');
-                  }}
-                  className="relative w-12 h-12 rounded-xl overflow-hidden shrink-0 bg-white/10 group cursor-pointer"
-                >
+              <div className="rounded-3xl bg-white/[0.03] border border-white/10 p-12 text-center flex flex-col items-center gap-3">
+                <Music2 className="w-10 h-10 text-white/35" />
+                <p className="text-sm text-white/75">
+                  {searchQuery
+                    ? '未找到匹配的歌曲'
+                    : filterMode === 'favorites'
+                    ? '暂无收藏的歌曲'
+                    : '曲库还是空的，快导入本地音乐吧'}
+                </p>
+              </div>
+            );
+          }
+          return (
+            <div className="rounded-3xl bg-white/[0.04] border border-white/10 divide-y divide-white/[0.06] overflow-visible">
+              {listTracks.map((track) => {
+                const active = currentTrack?.id === track.id;
+                return (
+                  <div
+                    key={track.id}
+                    className={`relative flex items-center gap-3 sm:gap-4 px-3.5 sm:px-5 py-3 transition-colors ${
+                      active ? 'bg-white/[0.09]' : 'hover:bg-white/[0.05]'
+                    }`}
+                  >
+                    {/* Cover Thumbnail */}
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        await playTrackById(
+                          track.id,
+                          listTracks.map((t) => t.id)
+                        );
+                        setActivePage('player');
+                      }}
+                      className="relative w-12 h-12 rounded-xl overflow-hidden shrink-0 bg-white/10 group cursor-pointer"
+                    >
                   {track.coverDataUrl && (
                     <img
                       src={track.coverDataUrl}
@@ -309,27 +354,32 @@ export const LibraryPage: React.FC = () => {
                   </div>
                 </button>
 
-                {/* Title, Artist, Album & Unboxed Real Technical Metadata */}
-                <button
-                  type="button"
-                  onClick={async () => {
-                    await playTrackById(
-                      track.id,
-                      filteredTracks.map((t) => t.id)
-                    );
-                    setActivePage('player');
-                  }}
-                  className="flex-1 min-w-0 text-left cursor-pointer"
-                >
-                  <p
-                    className="text-sm sm:text-[15px] font-medium truncate"
-                    style={{ color: active ? activePalette.primary : '#ffffff' }}
-                  >
-                    {track.title}
-                  </p>
-                  <p className="text-xs text-white/60 truncate mt-0.5">
-                    {track.artist} · {track.album}
-                  </p>
+                    {/* Title, Artist, Album & Unboxed Real Technical Metadata */}
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        await playTrackById(
+                          track.id,
+                          listTracks.map((t) => t.id)
+                        );
+                        setActivePage('player');
+                      }}
+                      className="flex-1 min-w-0 text-left cursor-pointer"
+                    >
+                      <p
+                        className="text-sm sm:text-[15px] font-medium truncate"
+                        style={{ color: active ? activePalette.primary : '#ffffff' }}
+                      >
+                        {track.title}
+                      </p>
+                      <p className="text-xs text-white/60 truncate mt-0.5">
+                        {track.artist}
+                        {track.composer && track.composer !== track.artist
+                          ? ` · 曲: ${track.composer}`
+                          : ''}
+                        {' · '}
+                        {track.album}
+                      </p>
                   <p className="text-[11px] text-white/45 font-mono-tabular truncate mt-0.5 sm:hidden">
                     {track.format} · {formatTime(track.duration)}
                   </p>
@@ -452,6 +502,16 @@ export const LibraryPage: React.FC = () => {
 
                   <button
                     type="button"
+                    onClick={() => setExportingTrackId(track.id)}
+                    title="导出同款播放视频与完整歌曲文件夹"
+                    aria-label="导出同款播放视频与完整歌曲文件夹"
+                    className="min-w-[38px] min-h-[38px] sm:min-w-[40px] sm:min-h-[40px] flex items-center justify-center rounded-xl text-white/65 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+                  >
+                    <Download className="w-4 h-4" />
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={() => deleteTrack(track.id)}
                     title="删除歌曲"
                     aria-label="删除歌曲"
@@ -460,11 +520,27 @@ export const LibraryPage: React.FC = () => {
                     <Trash2 className="w-4 h-4" />
                   </button>
                 </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
+                  </div>
+                );
+              })}
+            </div>
+          );
+        };
+
+        if (filterMode === 'artists') {
+          return (
+            <ArtistClassificationPanel
+              tracks={tracks}
+              searchQuery={searchQuery}
+              palette={activePalette}
+              onPlayAllGroupTracks={handlePlayGroupTracks}
+              renderTrackList={renderTrackRows}
+            />
+          );
+        }
+
+        return renderTrackRows(filteredTracks);
+      })()}
 
       <TrackInfoEditModal
         open={Boolean(editingTrack)}
@@ -472,6 +548,12 @@ export const LibraryPage: React.FC = () => {
         palette={activePalette}
         onClose={() => setEditingTrackId(null)}
         onSave={updateTrackInfo}
+      />
+
+      <TrackPackageExportModal
+        open={Boolean(exportingTrack)}
+        track={exportingTrack}
+        onClose={() => setExportingTrackId(null)}
       />
     </div>
   );

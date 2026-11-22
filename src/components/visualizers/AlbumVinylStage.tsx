@@ -15,7 +15,7 @@ interface AlbumVinylStageProps {
   fullscreen?: boolean;
 }
 
-export const AlbumVinylStage: React.FC<AlbumVinylStageProps> = ({
+export const AlbumVinylStage: React.FC<AlbumVinylStageProps> = React.memo(({
   coverUrl,
   title,
   trackId,
@@ -50,6 +50,11 @@ export const AlbumVinylStage: React.FC<AlbumVinylStageProps> = ({
     animationIntensity,
   });
   propsRef.current = { isPlaying, palette, animationIntensity };
+  const wakeRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    wakeRef.current?.();
+  }, [isPlaying, palette, animationIntensity]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -65,11 +70,13 @@ export const AlbumVinylStage: React.FC<AlbumVinylStageProps> = ({
     let smoothHigh = 0;
     let smoothVol = 0;
     let timeAcc = 0;
+    let lastDrawNow = 0;
+    let isHidden = typeof document !== 'undefined' ? document.hidden : false;
 
     const resize = () => {
       const rect = canvas.getBoundingClientRect();
       if (!rect.width || !rect.height) return;
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const dpr = Math.min(window.devicePixelRatio || 1, 1.75);
       const targetW = Math.round(rect.width * dpr);
       const targetH = Math.round(rect.height * dpr);
       if (canvas.width !== targetW || canvas.height !== targetH) {
@@ -82,17 +89,29 @@ export const AlbumVinylStage: React.FC<AlbumVinylStageProps> = ({
     const ro = new ResizeObserver(resize);
     ro.observe(canvas);
 
-    const render = () => {
+    const render = (now: number) => {
+      if (isHidden) {
+        rafId = 0;
+        return;
+      }
+
       const { isPlaying: playing, palette: pal, animationIntensity: intensity } =
         propsRef.current;
 
+      const minIntervalMs = intensity === 'low' ? 32 : intensity === 'high' ? 16 : 22;
+      if (lastDrawNow > 0 && now - lastDrawNow < minIntervalMs) {
+        rafId = requestAnimationFrame(render);
+        return;
+      }
+      lastDrawNow = now;
+
       // Smooth rotational inertia for vinyl record
       const targetVel = playing ? 0.36 : 0; // ~21.6 deg/sec at 60fps
-      angularVelocity += (targetVel - angularVelocity) * (playing ? 0.045 : 0.025);
+      angularVelocity += (targetVel - angularVelocity) * (playing ? 0.045 : 0.04);
       if (Math.abs(angularVelocity) > 0.0005) {
         rotationDeg = (rotationDeg + angularVelocity) % 360;
         if (discRef.current) {
-          discRef.current.style.transform = `rotate(${rotationDeg.toFixed(3)}deg)`;
+          discRef.current.style.transform = `translate3d(0,0,0) rotate(${rotationDeg.toFixed(2)}deg)`;
         }
       }
 
@@ -103,7 +122,7 @@ export const AlbumVinylStage: React.FC<AlbumVinylStageProps> = ({
         return;
       }
 
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const dpr = Math.min(window.devicePixelRatio || 1, 1.75);
       ctx.clearRect(0, 0, w, h);
 
       // Real-time Web Audio API analysis
@@ -207,13 +226,47 @@ export const AlbumVinylStage: React.FC<AlbumVinylStageProps> = ({
         ctx.stroke();
       }
 
+      if (
+        !playing &&
+        Math.abs(angularVelocity) <= 0.0006 &&
+        smoothVol < 0.004 &&
+        smoothBass < 0.004
+      ) {
+        rafId = 0;
+        return;
+      }
+
       rafId = requestAnimationFrame(render);
     };
 
-    rafId = requestAnimationFrame(render);
+    const startLoop = () => {
+      if (!rafId && !isHidden) {
+        lastDrawNow = 0;
+        rafId = requestAnimationFrame(render);
+      }
+    };
+
+    const onVisChange = () => {
+      isHidden = document.hidden;
+      if (isHidden) {
+        if (rafId) {
+          cancelAnimationFrame(rafId);
+          rafId = 0;
+        }
+      } else {
+        startLoop();
+      }
+    };
+
+    wakeRef.current = startLoop;
+    document.addEventListener('visibilitychange', onVisChange);
+    startLoop();
+
     return () => {
-      cancelAnimationFrame(rafId);
+      if (rafId) cancelAnimationFrame(rafId);
+      wakeRef.current = null;
       ro.disconnect();
+      document.removeEventListener('visibilitychange', onVisChange);
     };
   }, [animationIntensity]);
 
@@ -375,4 +428,4 @@ export const AlbumVinylStage: React.FC<AlbumVinylStageProps> = ({
       )}
     </div>
   );
-};
+});

@@ -29,7 +29,7 @@ interface LyricsViewProps {
   immersive?: boolean;
 }
 
-export const LyricsView: React.FC<LyricsViewProps> = ({
+export const LyricsView: React.FC<LyricsViewProps> = React.memo(({
   lyricsRaw,
   currentTime,
   offsetMs,
@@ -51,6 +51,7 @@ export const LyricsView: React.FC<LyricsViewProps> = ({
   const lrcFileInputRef = useRef<HTMLInputElement | null>(null);
   const [userScrolling, setUserScrolling] = useState(false);
   const userScrollTimerRef = useRef<number | null>(null);
+  const scrollRafRef = useRef<number | null>(null);
 
   const parsed = useMemo(() => parseLrc(lyricsRaw), [lyricsRaw]);
   const activeIdx = useMemo(
@@ -58,22 +59,72 @@ export const LyricsView: React.FC<LyricsViewProps> = ({
     [parsed.lines, currentTime, offsetMs]
   );
 
-  // Auto-scroll active lyric smoothly to center unless user is manually scrolling
+  const cancelSmoothScroll = () => {
+    if (scrollRafRef.current !== null) {
+      window.cancelAnimationFrame(scrollRafRef.current);
+      scrollRafRef.current = null;
+    }
+  };
+
   useEffect(() => {
-    if (activeIdx < 0 || userScrolling) return;
+    return () => {
+      cancelSmoothScroll();
+      if (userScrollTimerRef.current) {
+        window.clearTimeout(userScrollTimerRef.current);
+      }
+    };
+  }, []);
+
+  // Fluid rAF scroll interpolation keeping active lyric centered unless user is manually scrolling
+  useEffect(() => {
+    if (activeIdx < 0 || userScrolling) {
+      cancelSmoothScroll();
+      return;
+    }
     const container = containerRef.current;
     const activeEl = lineRefs.current.get(activeIdx);
     if (!container || !activeEl) return;
 
-    const targetTop =
-      activeEl.offsetTop - container.clientHeight / 2 + activeEl.clientHeight / 2;
-    container.scrollTo({
-      top: Math.max(0, targetTop),
-      behavior: 'smooth',
-    });
-  }, [activeIdx, userScrolling]);
+    const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+    const targetTop = Math.min(
+      maxScroll,
+      Math.max(
+        0,
+        activeEl.offsetTop - container.clientHeight / 2 + activeEl.clientHeight / 2
+      )
+    );
+    const startTop = container.scrollTop;
+    const delta = targetTop - startTop;
+    if (Math.abs(delta) <= 2) return;
+
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+      container.scrollTop = targetTop;
+      return;
+    }
+
+    cancelSmoothScroll();
+    const duration = Math.min(720, Math.max(460, 440 + Math.abs(delta) * 0.42));
+    const startTime = performance.now();
+
+    const step = (now: number) => {
+      const elapsed = now - startTime;
+      const progress = Math.min(1, elapsed / duration);
+      const eased = 1 - Math.pow(1 - progress, 3.8);
+      container.scrollTop = startTop + delta * eased;
+
+      if (progress < 1) {
+        scrollRafRef.current = window.requestAnimationFrame(step);
+      } else {
+        scrollRafRef.current = null;
+      }
+    };
+
+    scrollRafRef.current = window.requestAnimationFrame(step);
+    return cancelSmoothScroll;
+  }, [activeIdx, userScrolling, parsed.lines.length]);
 
   const handleManualScroll = () => {
+    cancelSmoothScroll();
     setUserScrolling(true);
     if (userScrollTimerRef.current) window.clearTimeout(userScrollTimerRef.current);
     userScrollTimerRef.current = window.setTimeout(() => {
@@ -101,7 +152,7 @@ export const LyricsView: React.FC<LyricsViewProps> = ({
             return (
               <span
                 key={`${line.id}-w-${wi}`}
-                className="transition-all duration-150"
+                className="transition-[color,text-shadow] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]"
                 style={{
                   color: isSung ? '#ffffff' : 'rgba(255,255,255,0.5)',
                   textShadow: isCurrentWord
@@ -317,7 +368,7 @@ export const LyricsView: React.FC<LyricsViewProps> = ({
                       ? 'opacity-48 hover:opacity-85'
                       : 'opacity-42'
                     : immersive
-                    ? 'opacity-24 blur-[0.45px] hover:opacity-75 hover:blur-none'
+                    ? 'opacity-30 hover:opacity-75'
                     : 'opacity-28';
               } else {
                 opacityClass =
@@ -330,10 +381,28 @@ export const LyricsView: React.FC<LyricsViewProps> = ({
                       ? 'opacity-40 hover:opacity-80'
                       : 'opacity-44'
                     : immersive
-                    ? 'opacity-22 blur-[0.55px] hover:opacity-75 hover:blur-none'
+                    ? 'opacity-28 hover:opacity-75'
                     : 'opacity-30';
               }
             }
+
+            let flowTransformClass = 'translate-y-0 translate-x-0 scale-100';
+            if (parsed.hasSyncedTimestamps && activeIdx >= 0) {
+              if (isActive) {
+                flowTransformClass = 'translate-y-0 translate-x-1.5 scale-[1.02]';
+              } else if (isPast) {
+                flowTransformClass = '-translate-y-1 translate-x-0 scale-[0.985]';
+              } else if (distance === 1) {
+                flowTransformClass = 'translate-y-1 translate-x-0 scale-[0.995]';
+              } else {
+                flowTransformClass = 'translate-y-2 translate-x-0 scale-[0.985]';
+              }
+            }
+
+            const cascadeDelayMs =
+              parsed.hasSyncedTimestamps && activeIdx >= 0 && !userScrolling
+                ? Math.min(distance, 5) * 32
+                : 0;
 
             return (
               <button
@@ -349,31 +418,44 @@ export const LyricsView: React.FC<LyricsViewProps> = ({
                     setUserScrolling(false);
                   }
                 }}
-                className={`w-full text-left rounded-2xl transition-all duration-300 ease-out block cursor-pointer ${
-                  immersive ? 'px-4 py-2.5' : 'px-3 py-2'
-                } ${opacityClass} ${
+                className={`relative overflow-hidden w-full text-left rounded-2xl transition-[opacity,transform,background-color] duration-[560ms] ease-[cubic-bezier(0.22,1,0.36,1)] origin-left block cursor-pointer ${
+                  immersive ? 'pl-5 pr-4 py-2.5' : 'pl-4 pr-3 py-2'
+                } ${opacityClass} ${flowTransformClass} ${
                   isActive
                     ? immersive
                       ? ''
-                      : 'bg-white/[0.06] backdrop-blur-sm'
+                      : 'bg-white/[0.08]'
                     : 'hover:bg-white/[0.03]'
                 }`}
-                style={
-                  isActive && immersive
+                style={{
+                  transitionDelay: cascadeDelayMs ? `${cascadeDelayMs}ms` : undefined,
+                  ...(isActive && immersive
                     ? {
                         background: `radial-gradient(ellipse at 18% 50%, ${palette.primary}1e 0%, rgba(255,255,255,0.035) 55%, transparent 100%)`,
                       }
-                    : undefined
-                }
+                    : undefined),
+                }}
               >
+                {parsed.hasSyncedTimestamps && (
+                  <span
+                    aria-hidden="true"
+                    className={`absolute left-1 top-2.5 bottom-2.5 w-[3px] rounded-full transition-[transform,opacity] duration-[520ms] ease-[cubic-bezier(0.22,1,0.36,1)] origin-top ${
+                      isActive ? 'opacity-100 scale-y-100' : 'opacity-0 scale-y-0'
+                    }`}
+                    style={{
+                      background: `linear-gradient(to bottom, ${palette.primary}, ${palette.secondary})`,
+                    }}
+                  />
+                )}
+
                 <p
-                  className={`font-display leading-snug transition-all duration-300 origin-left ${
+                  className={`font-display leading-snug transition-[color,text-shadow] duration-[480ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
                     isActive
                       ? immersive
-                        ? 'text-2xl sm:text-3xl xl:text-[34px] font-semibold tracking-tight text-white scale-[1.02]'
+                        ? 'text-2xl sm:text-3xl xl:text-[34px] font-semibold tracking-tight text-white'
                         : compact
-                        ? 'text-xl sm:text-2xl font-semibold text-white scale-[1.02]'
-                        : 'text-2xl sm:text-3xl font-semibold text-white scale-[1.02]'
+                        ? 'text-xl sm:text-2xl font-semibold text-white'
+                        : 'text-2xl sm:text-3xl font-semibold text-white'
                       : immersive
                       ? 'text-lg sm:text-xl xl:text-[21px] font-medium text-white/85'
                       : compact
@@ -395,7 +477,7 @@ export const LyricsView: React.FC<LyricsViewProps> = ({
 
                 {showBilingual && line.translation && (
                   <p
-                    className={`transition-all duration-300 ${
+                    className={`transition-[color,opacity,transform] duration-[480ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
                       isActive
                         ? immersive
                           ? 'mt-2 text-base sm:text-[17px] text-rose-50/82 font-light tracking-wide'
@@ -415,4 +497,4 @@ export const LyricsView: React.FC<LyricsViewProps> = ({
       )}
     </div>
   );
-};
+});

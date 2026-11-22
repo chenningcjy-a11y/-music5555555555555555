@@ -43,7 +43,7 @@ function cloneColors(c: FluidBackgroundColors): FluidBackgroundColors {
   };
 }
 
-export const DynamicBackground: React.FC<DynamicBackgroundProps> = ({
+export const DynamicBackground: React.FC<DynamicBackgroundProps> = React.memo(({
   palette,
   isPlaying,
   dynamicGlow,
@@ -113,7 +113,7 @@ export const DynamicBackground: React.FC<DynamicBackgroundProps> = ({
   useEffect(() => {
     resizeCanvasRef.current?.();
     wakeLoopRef.current?.();
-  }, [animationIntensity, reducedMotion]);
+  }, [isPlaying, dynamicGlow, glowIntensity, animationIntensity, reducedMotion, isFullscreen]);
 
   useEffect(() => {
     const root = rootRef.current;
@@ -368,9 +368,9 @@ export const DynamicBackground: React.FC<DynamicBackgroundProps> = ({
         return;
       }
 
-      // Frame pacing keeps GPU cool on Android tablets while maintaining silk smoothness
+      // Frame pacing keeps GPU cool on Android tablets & avoids backdrop-blur compositor tearing
       const minIntervalMs =
-        animMode === 'low' ? 40 : animMode === 'high' ? 16 : 26;
+        animMode === 'low' ? 48 : animMode === 'high' ? 22 : 33;
       if (now - lastDrawNow < minIntervalMs) {
         rafId = requestAnimationFrame(tick);
         return;
@@ -543,6 +543,18 @@ export const DynamicBackground: React.FC<DynamicBackgroundProps> = ({
         fullscreenBoost
       );
 
+      // Sleep rAF when paused and audio/color envelopes have smoothly settled to eliminate idle flicker
+      const settled =
+        !playing &&
+        !tr.active &&
+        smoothBass < 0.004 &&
+        smoothMid < 0.004 &&
+        smoothVol < 0.004;
+      if (settled) {
+        rafId = 0;
+        return;
+      }
+
       rafId = requestAnimationFrame(tick);
     };
 
@@ -588,6 +600,8 @@ export const DynamicBackground: React.FC<DynamicBackgroundProps> = ({
       className="fixed inset-0 -z-10 overflow-hidden pointer-events-none select-none"
       style={{
         backgroundColor: palette.deep || '#0b050a',
+        contain: 'strict',
+        transform: 'translateZ(0)',
       }}
     >
       {/* Layer 1: Deep Dark Base Gradient Backdrop */}
@@ -605,44 +619,44 @@ export const DynamicBackground: React.FC<DynamicBackgroundProps> = ({
       <div className="absolute inset-0 overflow-hidden">
         <div
           ref={blob0Ref}
-          className="absolute -top-[28%] -left-[22%] w-[115vmax] h-[115vmax] will-change-transform"
+          className="absolute -top-[24%] -left-[18%] w-[92vmax] h-[92vmax] will-change-transform"
           style={{
             background:
-              'radial-gradient(circle at 50% 50%, rgba(var(--fluid-silk-rgb, 96, 36, 68), 0.95) 0%, rgba(var(--fluid-silk-rgb, 96, 36, 68), 0.56) 28%, rgba(var(--fluid-silk-rgb, 96, 36, 68), 0.18) 54%, rgba(var(--fluid-silk-rgb, 96, 36, 68), 0) 74%)',
+              'radial-gradient(circle at 50% 50%, rgba(var(--fluid-silk-rgb, 96, 36, 68), 0.92) 0%, rgba(var(--fluid-silk-rgb, 96, 36, 68), 0.52) 30%, rgba(var(--fluid-silk-rgb, 96, 36, 68), 0.16) 56%, rgba(var(--fluid-silk-rgb, 96, 36, 68), 0) 75%)',
           }}
         />
 
         <div
           ref={blob1Ref}
-          className="absolute -bottom-[30%] -right-[20%] w-[112vmax] h-[112vmax] will-change-transform"
+          className="absolute -bottom-[26%] -right-[18%] w-[90vmax] h-[90vmax] will-change-transform"
           style={{
             background:
-              'radial-gradient(circle at 50% 50%, rgba(var(--fluid-secondary-rgb, 72, 42, 118), 0.92) 0%, rgba(var(--fluid-secondary-rgb, 72, 42, 118), 0.54) 30%, rgba(var(--fluid-secondary-rgb, 72, 42, 118), 0.16) 56%, rgba(var(--fluid-secondary-rgb, 72, 42, 118), 0) 75%)',
+              'radial-gradient(circle at 50% 50%, rgba(var(--fluid-secondary-rgb, 72, 42, 118), 0.9) 0%, rgba(var(--fluid-secondary-rgb, 72, 42, 118), 0.5) 30%, rgba(var(--fluid-secondary-rgb, 72, 42, 118), 0.15) 56%, rgba(var(--fluid-secondary-rgb, 72, 42, 118), 0) 75%)',
           }}
         />
 
         <div
           ref={blob2Ref}
-          className="absolute top-[6%] left-[12%] w-[96vmax] h-[86vmax] will-change-transform"
+          className="absolute top-[8%] left-[14%] w-[82vmax] h-[74vmax] will-change-transform"
           style={{
             background:
-              'radial-gradient(ellipse 62% 54% at 50% 50%, rgba(var(--fluid-silk-rgb, 96, 36, 68), 0.78) 0%, rgba(var(--fluid-secondary-rgb, 72, 42, 118), 0.44) 34%, rgba(var(--fluid-secondary-rgb, 72, 42, 118), 0.12) 58%, rgba(0, 0, 0, 0) 76%)',
+              'radial-gradient(ellipse 62% 54% at 50% 50%, rgba(var(--fluid-silk-rgb, 96, 36, 68), 0.72) 0%, rgba(var(--fluid-secondary-rgb, 72, 42, 118), 0.4) 36%, rgba(var(--fluid-secondary-rgb, 72, 42, 118), 0.1) 60%, rgba(0, 0, 0, 0) 76%)',
           }}
         />
 
         <div
           ref={blob3Ref}
-          className="absolute top-[18%] right-[16%] w-[82vmax] h-[74vmax] will-change-transform"
+          className="absolute top-[18%] right-[16%] w-[72vmax] h-[64vmax] will-change-transform"
           style={{
             background:
-              'radial-gradient(ellipse 58% 52% at 50% 50%, rgba(var(--fluid-mist-rgb, 152, 110, 148), 0.75) 0%, rgba(var(--fluid-mist-rgb, 152, 110, 148), 0.28) 38%, rgba(var(--fluid-mist-rgb, 152, 110, 148), 0) 72%)',
+              'radial-gradient(ellipse 58% 52% at 50% 50%, rgba(var(--fluid-mist-rgb, 152, 110, 148), 0.68) 0%, rgba(var(--fluid-mist-rgb, 152, 110, 148), 0.24) 40%, rgba(var(--fluid-mist-rgb, 152, 110, 148), 0) 72%)',
           }}
         />
       </div>
 
-      {/* Layer 2.5: Luminous Theme-Gradient Fluid Wash Overlay */}
+      {/* Layer 2.5: Luminous Theme-Gradient Fluid Wash Overlay (single-pass normal blending prevents Android GPU tile flicker) */}
       <div
-        className="absolute inset-0 opacity-45 mix-blend-screen pointer-events-none transition-opacity duration-1000"
+        className="absolute inset-0 opacity-35 pointer-events-none"
         style={{
           background: `
             radial-gradient(circle at 22% 28%, rgba(var(--fluid-silk-rgb, 96, 36, 68), 0.52) 0%, transparent 58%),
@@ -668,4 +682,4 @@ export const DynamicBackground: React.FC<DynamicBackgroundProps> = ({
       />
     </div>
   );
-};
+});

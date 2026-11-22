@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { ArrowLeftRight, Check, Disc3, Pencil, X } from 'lucide-react';
 import { TrackColorPalette, TrackMetadata } from '../types/music';
 
@@ -9,7 +10,7 @@ interface TrackInfoEditModalProps {
   onClose: () => void;
   onSave: (
     id: string,
-    patch: { title: string; artist: string; album: string }
+    patch: { title: string; artist: string; composer?: string; album: string }
   ) => Promise<void> | void;
 }
 
@@ -22,6 +23,7 @@ export const TrackInfoEditModal: React.FC<TrackInfoEditModalProps> = ({
 }) => {
   const [title, setTitle] = useState('');
   const [artist, setArtist] = useState('');
+  const [composer, setComposer] = useState('');
   const [album, setAlbum] = useState('');
   const [saving, setSaving] = useState(false);
 
@@ -29,6 +31,7 @@ export const TrackInfoEditModal: React.FC<TrackInfoEditModalProps> = ({
     if (open && track) {
       setTitle(track.title || '');
       setArtist(track.artist || '');
+      setComposer(track.composer || '');
       setAlbum(track.album || '');
     }
   }, [open, track]);
@@ -49,6 +52,7 @@ export const TrackInfoEditModal: React.FC<TrackInfoEditModalProps> = ({
       await onSave(track.id, {
         title: nextTitle,
         artist: artist.trim() || '未知艺术家',
+        composer: composer.trim(),
         album: album.trim() || '本地音乐',
       });
       onClose();
@@ -57,7 +61,7 @@ export const TrackInfoEditModal: React.FC<TrackInfoEditModalProps> = ({
     }
   };
 
-  return (
+  return createPortal(
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md p-4"
       onClick={onClose}
@@ -145,6 +149,19 @@ export const TrackInfoEditModal: React.FC<TrackInfoEditModalProps> = ({
 
           <div>
             <label className="text-xs font-medium text-white/80 block mb-1.5">
+              作曲家 / 创作人（可选，相同作曲家可自动归类为同一分区）
+            </label>
+            <input
+              type="text"
+              value={composer}
+              onChange={(e) => setComposer(e.target.value)}
+              placeholder="输入作曲家或制作人（留空则默认按歌手或歌词注释识别）"
+              className="w-full px-3.5 py-2.5 rounded-xl bg-black/35 border border-white/15 text-sm text-white placeholder-white/35 focus:outline-none focus:border-white/35"
+            />
+          </div>
+
+          <div>
+            <label className="text-xs font-medium text-white/80 block mb-1.5">
               专辑名称（可选）
             </label>
             <input
@@ -179,6 +196,7 @@ export const TrackInfoEditModal: React.FC<TrackInfoEditModalProps> = ({
           </div>
         </form>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 };

@@ -14,15 +14,13 @@ import {
 import { LyricsEditorModal } from '../components/lyrics/LyricsEditorModal';
 import { LyricsSearchModal } from '../components/lyrics/LyricsSearchModal';
 import { LyricsView } from '../components/lyrics/LyricsView';
-import { useMusic } from '../context/MusicContext';
+import { useMusic, usePlaybackTime } from '../context/MusicContext';
 import { formatTime } from '../utils/constants';
 
 export const LyricsPage: React.FC = () => {
   const {
     currentTrack,
     isPlaying,
-    currentTime,
-    duration,
     activePalette,
     personalization,
     isFullscreen,
@@ -36,6 +34,7 @@ export const LyricsPage: React.FC = () => {
     updatePersonalization,
     showToast,
   } = useMusic();
+  const { currentTime, duration } = usePlaybackTime();
 
   const [searchOpen, setSearchOpen] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);

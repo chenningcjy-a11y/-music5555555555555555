@@ -9,7 +9,7 @@ interface LiquidWaveCanvasProps {
   visible?: boolean;
 }
 
-export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
+export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = React.memo(({
   isPlaying,
   palette,
   intensity,
@@ -18,6 +18,11 @@ export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef({ isPlaying, palette, intensity, visible });
   stateRef.current = { isPlaying, palette, intensity, visible };
+  const wakeRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    wakeRef.current?.();
+  }, [isPlaying, palette, intensity, visible]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -31,6 +36,8 @@ export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
     let smoothMid = 0;
     let smoothHigh = 0;
     let smoothVol = 0;
+    let lastDrawNow = 0;
+    let isHidden = typeof document !== 'undefined' ? document.hidden : false;
 
     // Smooth color interpolation for seamless album transitions
     let curR1 = palette.rgbPrimary[0];
@@ -43,7 +50,7 @@ export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
     const resize = () => {
       const rect = canvas.getBoundingClientRect();
       if (!rect.width || !rect.height) return;
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
       const w = Math.round(rect.width * dpr);
       const h = Math.round(rect.height * dpr);
       if (canvas.width !== w || canvas.height !== h) {
@@ -73,7 +80,7 @@ export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
       fillAlpha: number,
       strokeAlpha: number
     ) => {
-      const segments = 64;
+      const segments = 56;
       const points: { x: number; y: number }[] = [];
       const baseY = h * baseYRatio;
 
@@ -81,21 +88,17 @@ export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
         const t = i / segments;
         const x = t * w;
 
-        // Real spectrum lookup per horizontal segment (low -> mid -> high distributed cleanly)
         const specIdx = Math.min(
           freqs.length - 1,
           Math.floor(Math.pow(t, 1.35) * 160) + layerIdx * 8
         );
         const specEnergy = (freqs[specIdx] || 0) / 255;
 
-        // Real time-domain subtle displacement
         const waveIdx = Math.floor(t * (waveform.length - 1));
         const timeDisp = ((waveform[waveIdx] || 128) - 128) / 128;
 
-        // Edge taper so waves meet bottom corners smoothly
         const edgeWindow = Math.sin(t * Math.PI);
 
-        // Low freq drives large swells, high freq drives fine ripples
         const swell =
           Math.sin(t * Math.PI * (2.2 + layerIdx * 0.7) * freqScale + phase * speedMult + layerIdx * 1.4) *
           (ampBase * (0.35 + smoothBass * 1.45));
@@ -120,7 +123,6 @@ export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
         points.push({ x, y: Math.max(4 * dpr, Math.min(h - 2, y)) });
       }
 
-      ctx.save();
       ctx.beginPath();
       ctx.moveTo(0, h);
       ctx.lineTo(points[0].x, points[0].y);
@@ -134,8 +136,11 @@ export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
       ctx.lineTo(w, h);
       ctx.closePath();
 
+      const rr = Math.round(r);
+      const rg = Math.round(g);
+      const rb = Math.round(b);
       const grad = ctx.createLinearGradient(0, baseY - ampBase * 1.4, 0, h);
-      grad.addColorStop(0, `rgba(${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)}, ${fillAlpha})`);
+      grad.addColorStop(0, `rgba(${rr}, ${rg}, ${rb}, ${fillAlpha})`);
       grad.addColorStop(
         1,
         `rgba(${Math.round(r * 0.45)}, ${Math.round(g * 0.45)}, ${Math.round(b * 0.45)}, ${
@@ -145,7 +150,7 @@ export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
       ctx.fillStyle = grad;
       ctx.fill();
 
-      // Luminous liquid surface rim
+      // Dual-pass luminous liquid rim (replaces CPU-heavy shadowBlur Gaussian blur)
       ctx.beginPath();
       ctx.moveTo(points[0].x, points[0].y);
       for (let i = 0; i < points.length - 1; i++) {
@@ -154,18 +159,25 @@ export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
         ctx.quadraticCurveTo(points[i].x, points[i].y, xc, yc);
       }
       ctx.lineTo(w, points[points.length - 1].y);
-      ctx.strokeStyle = `rgba(${Math.min(255, Math.round(r + 45))}, ${Math.min(
-        255,
-        Math.round(g + 45)
-      )}, ${Math.min(255, Math.round(b + 45))}, ${strokeAlpha})`;
-      ctx.lineWidth = (layerIdx === 2 ? 2.1 : 1.35) * dpr;
-      ctx.shadowColor = `rgba(${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)}, 0.75)`;
-      ctx.shadowBlur = (layerIdx === 2 ? 12 : 6) * dpr;
+
+      ctx.strokeStyle = `rgba(${rr}, ${rg}, ${rb}, ${(strokeAlpha * 0.28).toFixed(3)})`;
+      ctx.lineWidth = (layerIdx === 2 ? 6.0 : 3.8) * dpr;
       ctx.stroke();
-      ctx.restore();
+
+      ctx.strokeStyle = `rgba(${Math.min(255, rr + 45)}, ${Math.min(
+        255,
+        rg + 45
+      )}, ${Math.min(255, rb + 45)}, ${strokeAlpha})`;
+      ctx.lineWidth = (layerIdx === 2 ? 2.0 : 1.3) * dpr;
+      ctx.stroke();
     };
 
-    const render = () => {
+    const render = (now: number) => {
+      if (isHidden) {
+        rafId = 0;
+        return;
+      }
+
       const { isPlaying: playing, palette: pal, intensity: mode, visible: vis } =
         stateRef.current;
 
@@ -174,20 +186,27 @@ export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
 
       if (!vis || w === 0 || h === 0) {
         if (w > 0 && h > 0) ctx.clearRect(0, 0, w, h);
-        rafId = requestAnimationFrame(render);
+        rafId = 0;
         return;
       }
 
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const minIntervalMs = mode === 'low' ? 44 : mode === 'high' ? 18 : 30;
+      if (lastDrawNow > 0 && now - lastDrawNow < minIntervalMs) {
+        rafId = requestAnimationFrame(render);
+        return;
+      }
+      lastDrawNow = now;
+
+      const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
       ctx.clearRect(0, 0, w, h);
 
       // Lerp palette colors
-      curR1 += (pal.rgbPrimary[0] - curR1) * 0.04;
-      curG1 += (pal.rgbPrimary[1] - curG1) * 0.04;
-      curB1 += (pal.rgbPrimary[2] - curB1) * 0.04;
-      curR2 += (pal.rgbSecondary[0] - curR2) * 0.04;
-      curG2 += (pal.rgbSecondary[1] - curG2) * 0.04;
-      curB2 += (pal.rgbSecondary[2] - curB2) * 0.04;
+      curR1 += (pal.rgbPrimary[0] - curR1) * 0.08;
+      curG1 += (pal.rgbPrimary[1] - curG1) * 0.08;
+      curB1 += (pal.rgbPrimary[2] - curB1) * 0.08;
+      curR2 += (pal.rgbSecondary[0] - curR2) * 0.08;
+      curG2 += (pal.rgbSecondary[1] - curG2) * 0.08;
+      curB2 += (pal.rgbSecondary[2] - curB2) * 0.08;
 
       const frame = audioEngine.getAnalysisFrame();
       const targetBass = playing ? frame.bass : 0;
@@ -195,17 +214,16 @@ export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
       const targetHigh = playing ? frame.high : 0;
       const targetVol = playing ? frame.volume : 0;
 
-      smoothBass += (targetBass - smoothBass) * (playing ? 0.2 : 0.05);
-      smoothMid += (targetMid - smoothMid) * (playing ? 0.2 : 0.05);
-      smoothHigh += (targetHigh - smoothHigh) * (playing ? 0.25 : 0.06);
-      smoothVol += (targetVol - smoothVol) * (playing ? 0.18 : 0.045);
+      smoothBass += (targetBass - smoothBass) * (playing ? 0.22 : 0.08);
+      smoothMid += (targetMid - smoothMid) * (playing ? 0.22 : 0.08);
+      smoothHigh += (targetHigh - smoothHigh) * (playing ? 0.26 : 0.09);
+      smoothVol += (targetVol - smoothVol) * (playing ? 0.2 : 0.075);
 
       const mult = mode === 'low' ? 0.65 : mode === 'high' ? 1.25 : 1.0;
-      phase += (playing ? 0.028 + smoothMid * 0.04 : 0.008) * mult;
+      phase += (playing ? 0.036 + smoothMid * 0.05 : 0.01) * mult;
 
       const maxAmp = h * 0.36 * mult;
 
-      // Back secondary wave
       drawLayer(
         w,
         h,
@@ -224,7 +242,6 @@ export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
         0.38
       );
 
-      // Mid blended wave
       drawLayer(
         w,
         h,
@@ -243,7 +260,6 @@ export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
         0.52
       );
 
-      // Front primary luminous wave
       drawLayer(
         w,
         h,
@@ -262,13 +278,48 @@ export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
         0.78
       );
 
+      const colorSettled =
+        Math.abs(pal.rgbPrimary[0] - curR1) < 0.8 &&
+        Math.abs(pal.rgbPrimary[1] - curG1) < 0.8 &&
+        Math.abs(pal.rgbPrimary[2] - curB1) < 0.8 &&
+        Math.abs(pal.rgbSecondary[0] - curR2) < 0.8;
+
+      if (!playing && colorSettled && smoothVol < 0.004 && smoothBass < 0.004) {
+        rafId = 0;
+        return;
+      }
+
       rafId = requestAnimationFrame(render);
     };
 
-    rafId = requestAnimationFrame(render);
+    const startLoop = () => {
+      if (!rafId && !isHidden && stateRef.current.visible) {
+        lastDrawNow = 0;
+        rafId = requestAnimationFrame(render);
+      }
+    };
+
+    const onVisChange = () => {
+      isHidden = document.hidden;
+      if (isHidden) {
+        if (rafId) {
+          cancelAnimationFrame(rafId);
+          rafId = 0;
+        }
+      } else {
+        startLoop();
+      }
+    };
+
+    wakeRef.current = startLoop;
+    document.addEventListener('visibilitychange', onVisChange);
+    startLoop();
+
     return () => {
-      cancelAnimationFrame(rafId);
+      if (rafId) cancelAnimationFrame(rafId);
+      wakeRef.current = null;
       ro.disconnect();
+      document.removeEventListener('visibilitychange', onVisChange);
     };
   }, []);
 
@@ -279,6 +330,7 @@ export const LiquidWaveCanvas: React.FC<LiquidWaveCanvasProps> = ({
       ref={canvasRef}
       aria-hidden="true"
       className="w-full h-full pointer-events-none block"
+      style={{ transform: 'translateZ(0)' }}
     />
   );
-};
+});

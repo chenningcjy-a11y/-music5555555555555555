@@ -7,7 +7,7 @@ interface FullscreenCoverFluidStageProps {
   trackId?: string;
 }
 
-export const FullscreenCoverFluidStage: React.FC<FullscreenCoverFluidStageProps> = ({
+export const FullscreenCoverFluidStage: React.FC<FullscreenCoverFluidStageProps> = React.memo(({
   coverUrl,
   title,
   trackId,
@@ -52,4 +52,4 @@ export const FullscreenCoverFluidStage: React.FC<FullscreenCoverFluidStageProps>
       </div>
     </div>
   );
-};
+});

@@ -17,7 +17,7 @@ import {
 import { MvAudioWaveformBar } from '../components/visualizers/MvAudioWaveformBar';
 import { MvTheaterAiAssistantCard } from '../components/visualizers/MvTheaterAiAssistantCard';
 import { SongAudioWaveformBar } from '../components/visualizers/SongAudioWaveformBar';
-import { useMusic } from '../context/MusicContext';
+import { useMusic, usePlaybackTime } from '../context/MusicContext';
 import {
   MvTheaterAiAnalysisResult,
   MvTheaterAiMidBreakSuggestion,
@@ -38,8 +38,6 @@ export const MvPage: React.FC = () => {
   const {
     tracks,
     currentTrack,
-    currentTime,
-    duration,
     isPlaying,
     activePalette,
     personalization,
@@ -63,6 +61,7 @@ export const MvPage: React.FC = () => {
     restartTrackWithMvIntro,
     showToast,
   } = useMusic();
+  const { currentTime, duration } = usePlaybackTime();
 
   const [activeTab, setActiveTab] = useState<MvTab>('timeline');
   const [urlInput, setUrlInput] = useState('');
