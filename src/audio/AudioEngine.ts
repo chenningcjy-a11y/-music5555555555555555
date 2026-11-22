@@ -73,6 +73,8 @@ export class LuminaAudioEngine {
   private currentMuted = false;
   private currentObjectUrl: string | null = null;
   private primingAudio = false;
+  private primingSeq = 0;
+  private primingClearTimer: number | null = null;
   private playOpSeq = 0;
   private pendingPlayPromise: Promise<void> | null = null;
 
@@ -366,8 +368,73 @@ export class LuminaAudioEngine {
   public async resumeContext(): Promise<void> {
     const ctx = this.ensureInitialized();
     if (ctx.state === 'suspended') {
-      await ctx.resume();
+      await Promise.race([
+        ctx.resume(),
+        new Promise<void>((resolve) => window.setTimeout(resolve, 600)),
+      ]);
     }
+  }
+
+  /**
+   * Must be called synchronously inside a click/tap handler BEFORE any async IndexedDB awaits,
+   * so mobile/tablet Chromium binds transient user activation cleanly without disturbing an already-loaded track.
+   */
+  public unlockInUserGesture(): void {
+    try {
+      const ctx = this.ensureInitialized();
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      // Only run silent WAV unlock on audioEl when no track src is loaded yet;
+      // calling play() on an already-loaded element synchronously flips el.paused=false and races togglePlayPause.
+      if (this.audioEl.src || !this.audioEl.paused) return;
+
+      const seq = ++this.primingSeq;
+      if (this.primingClearTimer !== null) {
+        window.clearTimeout(this.primingClearTimer);
+        this.primingClearTimer = null;
+      }
+      this.primingAudio = true;
+
+      const prevMuted = this.audioEl.muted;
+      this.audioEl.muted = true;
+      // 0.05s silent PCM WAV data URI unlocks HTMLAudioElement activation without touching real track blob
+      this.audioEl.src =
+        'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+
+      const opAtStart = this.playOpSeq;
+      const p = this.audioEl.play();
+      if (p && typeof p.then === 'function') {
+        p.then(() => {
+          if (this.playOpSeq === opAtStart) {
+            this.audioEl.pause();
+            this.audioEl.removeAttribute('src');
+          }
+        })
+          .catch(() => {})
+          .finally(() => {
+            this.audioEl.muted = prevMuted;
+            this.scheduleClearPriming(seq);
+          });
+      } else {
+        this.audioEl.muted = prevMuted;
+        this.scheduleClearPriming(seq);
+      }
+    } catch {
+      // ignore unlock errors
+    }
+  }
+
+  private scheduleClearPriming(seq: number): void {
+    if (this.primingClearTimer !== null) {
+      window.clearTimeout(this.primingClearTimer);
+    }
+    this.primingClearTimer = window.setTimeout(() => {
+      this.primingClearTimer = null;
+      if (this.primingSeq === seq) {
+        this.primingAudio = false;
+      }
+    }, 80);
   }
 
   private stopStemSources(): void {
@@ -491,6 +558,11 @@ export class LuminaAudioEngine {
 
   public loadBlob(blob: Blob): string {
     this.playOpSeq++;
+    this.primingAudio = false;
+    if (this.primingClearTimer !== null) {
+      window.clearTimeout(this.primingClearTimer);
+      this.primingClearTimer = null;
+    }
     this.audioEl.pause();
     this.clearStems();
     if (this.currentObjectUrl) {
@@ -506,21 +578,45 @@ export class LuminaAudioEngine {
 
   public async play(): Promise<void> {
     const op = ++this.playOpSeq;
+    // Cancel any lingering priming state so real playback events propagate immediately
+    this.primingSeq++;
+    this.primingAudio = false;
+    if (this.primingClearTimer !== null) {
+      window.clearTimeout(this.primingClearTimer);
+      this.primingClearTimer = null;
+    }
+
+    this.audioEl.muted = false;
     await this.resumeContext();
     if (op !== this.playOpSeq || !this.audioEl.src) return;
 
-    const promise = this.audioEl.play();
-    this.pendingPlayPromise = promise;
+    const attemptPlay = async (): Promise<void> => {
+      const promise = this.audioEl.play();
+      this.pendingPlayPromise = promise;
+      try {
+        await promise;
+      } finally {
+        if (this.pendingPlayPromise === promise) {
+          this.pendingPlayPromise = null;
+        }
+      }
+    };
+
     try {
-      await promise;
+      await attemptPlay();
     } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
+      if (op !== this.playOpSeq) {
         return;
       }
-      throw err;
-    } finally {
-      if (this.pendingPlayPromise === promise) {
-        this.pendingPlayPromise = null;
+      // If a priming pause/seek/load raced with play() via AbortError, retry once cleanly
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 45));
+        if (op !== this.playOpSeq || !this.audioEl.src) return;
+        if (this.audioEl.paused) {
+          await attemptPlay();
+        }
+      } else {
+        throw err;
       }
     }
 
@@ -540,6 +636,12 @@ export class LuminaAudioEngine {
 
   public pause(): void {
     const op = ++this.playOpSeq;
+    this.primingSeq++;
+    this.primingAudio = false;
+    if (this.primingClearTimer !== null) {
+      window.clearTimeout(this.primingClearTimer);
+      this.primingClearTimer = null;
+    }
     this.stopStemSources();
     const pending = this.pendingPlayPromise;
     if (pending) {
@@ -615,9 +717,14 @@ export class LuminaAudioEngine {
    */
   public async primeForDelayedPlayback(): Promise<void> {
     const op = ++this.playOpSeq;
+    const pSeq = ++this.primingSeq;
+    if (this.primingClearTimer !== null) {
+      window.clearTimeout(this.primingClearTimer);
+      this.primingClearTimer = null;
+    }
     const ctx = this.ensureInitialized();
     if (ctx.state === 'suspended') {
-      await ctx.resume().catch(() => {});
+      ctx.resume().catch(() => {});
     }
     if (op !== this.playOpSeq) return;
     if (this.songMixGain) {
@@ -625,6 +732,7 @@ export class LuminaAudioEngine {
       this.songMixGain.gain.setValueAtTime(0, ctx.currentTime);
     }
     if (!this.audioEl.src) return;
+    this.audioEl.muted = false;
     this.primingAudio = true;
     try {
       this.audioEl.currentTime = 0;
@@ -644,7 +752,7 @@ export class LuminaAudioEngine {
     } catch {
       // Ignore AbortError or metadata not yet buffered
     } finally {
-      this.primingAudio = false;
+      this.scheduleClearPriming(pSeq);
     }
   }
 

@@ -1,5 +1,5 @@
-import { Muxer as Mp4Muxer, ArrayBufferTarget as Mp4ArrayBufferTarget } from 'mp4-muxer';
-import { Muxer as WebmMuxer, ArrayBufferTarget as WebmArrayBufferTarget } from 'webm-muxer';
+import { Muxer as Mp4Muxer, StreamTarget as Mp4StreamTarget } from 'mp4-muxer';
+import { Muxer as WebmMuxer, StreamTarget as WebmStreamTarget } from 'webm-muxer';
 import {
   AnimationIntensity,
   AudioAnalysisFrame,
@@ -25,7 +25,146 @@ import {
   normalizeMidBreaks,
 } from '../utils/mvTimeline';
 
-export type StageVideoQuality = '720p' | '1080p';
+export type StageVideoQuality = '720p' | '1080p' | '1440p' | '2160p';
+
+const QUALITY_DIMENSIONS: Record<StageVideoQuality, { width: number; height: number }> = {
+  '720p': { width: 1280, height: 720 },
+  '1080p': { width: 1920, height: 1080 },
+  '1440p': { width: 2560, height: 1440 },
+  '2160p': { width: 3840, height: 2160 },
+};
+
+function getTargetBitrate(width: number, fps: number): number {
+  // Prioritize visual quality & smooth high-motion encoding across 720p-2160p
+  if (width >= 3840) {
+    return fps >= 100 ? 64_000_000 : fps >= 60 ? 48_000_000 : 32_000_000;
+  }
+  if (width >= 2560) {
+    return fps >= 100 ? 40_000_000 : fps >= 60 ? 28_000_000 : 20_000_000;
+  }
+  if (width >= 1920) {
+    return fps >= 100 ? 24_000_000 : fps >= 60 ? 18_000_000 : 12_000_000;
+  }
+  return fps >= 100 ? 14_000_000 : fps >= 60 ? 10_000_000 : 7_000_000;
+}
+
+/**
+ * Yields to the browser event loop without the 4ms minimum clamp of setTimeout(0).
+ */
+function yieldImmediate(): Promise<void> {
+  if (typeof MessageChannel !== 'undefined') {
+    return new Promise((resolve) => {
+      const ch = new MessageChannel();
+      ch.port1.onmessage = () => resolve();
+      ch.port2.postMessage(null);
+    });
+  }
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/**
+ * 4 MiB Blob-backed paged stream sink for MP4/WebM StreamTarget.
+ * Instead of growing a single 500MB+ contiguous ArrayBuffer in V8 heap (which spikes >1.5GB during resize/slice
+ * and crashes mobile/tablet tabs at ~98% finalize), completed 4 MiB pages are sealed into Blink Blobs
+ * immediately and small header back-patches (mdat size / WebM header) are applied only to affected pages.
+ */
+class PagedBlobSink {
+  private readonly pageSize = 4 * 1024 * 1024;
+  private sealedBlobs: Blob[] = [];
+  private activePageIndex = 0;
+  private activeBuf: Uint8Array<ArrayBuffer> | null = new Uint8Array(4 * 1024 * 1024);
+  private totalBytes = 0;
+  private patches = new Map<number, Array<{ offset: number; bytes: Uint8Array<ArrayBuffer> }>>();
+
+  write(position: number, data: Uint8Array): void {
+    if (!data || data.byteLength === 0) return;
+
+    const endPos = position + data.byteLength;
+    if (endPos > this.totalBytes) {
+      this.totalBytes = endPos;
+    }
+
+    let srcOffset = 0;
+    while (srcOffset < data.byteLength) {
+      const absPos = position + srcOffset;
+      const pageIdx = Math.floor(absPos / this.pageSize);
+      const offsetInPage = absPos - pageIdx * this.pageSize;
+      const writeLen = Math.min(data.byteLength - srcOffset, this.pageSize - offsetInPage);
+      const slice = data.subarray(srcOffset, srcOffset + writeLen);
+
+      if (pageIdx < this.activePageIndex) {
+        let list = this.patches.get(pageIdx);
+        if (!list) {
+          list = [];
+          this.patches.set(pageIdx, list);
+        }
+        list.push({ offset: offsetInPage, bytes: new Uint8Array(slice) });
+      } else {
+        while (this.activePageIndex < pageIdx) {
+          this.sealActivePage(this.pageSize);
+          this.activePageIndex++;
+          this.activeBuf = new Uint8Array(this.pageSize);
+        }
+        if (!this.activeBuf) {
+          this.activeBuf = new Uint8Array(this.pageSize);
+        }
+        this.activeBuf.set(slice, offsetInPage);
+      }
+
+      srcOffset += writeLen;
+    }
+  }
+
+  private sealActivePage(validLength: number): void {
+    if (!this.activeBuf) return;
+    if (validLength > 0) {
+      if (validLength === this.activeBuf.byteLength) {
+        this.sealedBlobs.push(new Blob([this.activeBuf]));
+      } else {
+        this.sealedBlobs.push(new Blob([this.activeBuf.slice(0, validLength)]));
+      }
+    }
+    this.activeBuf = null;
+  }
+
+  async toBlob(mimeType: string): Promise<Blob> {
+    if (this.totalBytes === 0) {
+      this.dispose();
+      return new Blob([], { type: mimeType });
+    }
+
+    const lastPageStart = this.activePageIndex * this.pageSize;
+    const remaining = Math.max(0, this.totalBytes - lastPageStart);
+    if (this.activeBuf && remaining > 0) {
+      this.sealActivePage(Math.min(this.pageSize, remaining));
+    } else {
+      this.activeBuf = null;
+    }
+
+    if (this.patches.size > 0) {
+      for (const [pageIdx, list] of this.patches.entries()) {
+        const origBlob = this.sealedBlobs[pageIdx];
+        if (!origBlob) continue;
+        const pageBuf = new Uint8Array(await origBlob.arrayBuffer());
+        for (const p of list) {
+          pageBuf.set(p.bytes, p.offset);
+        }
+        this.sealedBlobs[pageIdx] = new Blob([pageBuf]);
+      }
+      this.patches.clear();
+    }
+
+    const finalBlob = new Blob(this.sealedBlobs, { type: mimeType });
+    this.sealedBlobs = [];
+    return finalBlob;
+  }
+
+  dispose(): void {
+    this.sealedBlobs = [];
+    this.activeBuf = null;
+    this.patches.clear();
+  }
+}
 
 export interface StageRenderOptions {
   track: TrackMetadata;
@@ -37,7 +176,7 @@ export interface StageRenderOptions {
   fontPreset?: FontPresetId;
   animationIntensity: AnimationIntensity;
   quality: StageVideoQuality;
-  fps?: number; // 60 .. 120
+  fps?: number; // 30 .. 120
   startOffsetSec?: number; // Custom start offset in seconds (default 0)
   clipDurationSec?: number | null; // null/undefined = full duration from startOffsetSec
   mvUiFadeInSec?: number;
@@ -192,13 +331,16 @@ function cubicBezierEaseOut(t: number): number {
 }
 
 /**
- * Lightweight 256-point Radix-2 Cooley-Tukey FFT for offline audio envelope computation.
+ * Lightweight 256-point Radix-2 Cooley-Tukey FFT with precomputed twiddle & bit-reversal tables.
  */
 class OfflineAudioAnalyzer {
   private monoSamples: Float32Array;
   private sampleRate: number;
   private readonly fftSize = 256;
   private hannWindow: Float32Array;
+  private bitRev: Uint8Array;
+  private twCos: Float32Array;
+  private twSin: Float32Array;
   private real: Float32Array;
   private imag: Float32Array;
   private frequencies = new Uint8Array(128);
@@ -219,66 +361,70 @@ class OfflineAudioAnalyzer {
       this.monoSamples = ch0;
     }
 
-    this.hannWindow = new Float32Array(this.fftSize);
-    for (let i = 0; i < this.fftSize; i++) {
-      this.hannWindow[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (this.fftSize - 1)));
+    const N = this.fftSize;
+    this.hannWindow = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      this.hannWindow[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (N - 1)));
     }
-    this.real = new Float32Array(this.fftSize);
-    this.imag = new Float32Array(this.fftSize);
+
+    this.bitRev = new Uint8Array(N);
+    for (let i = 0; i < N; i++) {
+      let x = i;
+      let r = 0;
+      for (let b = 0; b < 8; b++) {
+        r = (r << 1) | (x & 1);
+        x >>= 1;
+      }
+      this.bitRev[i] = r;
+    }
+
+    this.twCos = new Float32Array(N / 2);
+    this.twSin = new Float32Array(N / 2);
+    for (let i = 0; i < N / 2; i++) {
+      const angle = (-2 * Math.PI * i) / N;
+      this.twCos[i] = Math.cos(angle);
+      this.twSin[i] = Math.sin(angle);
+    }
+
+    this.real = new Float32Array(N);
+    this.imag = new Float32Array(N);
   }
 
   sampleAt(timeSec: number): AudioAnalysisFrame {
     const N = this.fftSize;
     const center = Math.floor(timeSec * this.sampleRate);
     const start = Math.max(0, center - N / 2);
+    const mono = this.monoSamples;
+    const monoLen = mono.length;
 
     let sumSq = 0;
     for (let i = 0; i < N; i++) {
       const idx = start + i;
-      const sample = idx < this.monoSamples.length ? this.monoSamples[idx] : 0;
+      const sample = idx < monoLen ? mono[idx] : 0;
       sumSq += sample * sample;
-      this.real[i] = sample * this.hannWindow[i];
-      this.imag[i] = 0;
-      if (i < 128) {
-        const wIdx = start + i * 2;
-        const ws = wIdx < this.monoSamples.length ? this.monoSamples[wIdx] : 0;
-        this.waveform[i] = Math.max(0, Math.min(255, Math.round((ws * 0.5 + 0.5) * 255)));
-      }
-    }
-
-    let j = 0;
-    for (let i = 0; i < N; i++) {
-      if (i < j) {
-        const tr = this.real[i];
-        const ti = this.imag[i];
-        this.real[i] = this.real[j];
-        this.imag[i] = this.imag[j];
-        this.real[j] = tr;
-        this.imag[j] = ti;
-      }
-      let m = N >> 1;
-      while (m >= 1 && j >= m) {
-        j -= m;
-        m >>= 1;
-      }
-      j += m;
+      const rev = this.bitRev[i];
+      this.real[rev] = sample * this.hannWindow[i];
+      this.imag[rev] = 0;
     }
 
     for (let size = 2; size <= N; size <<= 1) {
       const half = size >> 1;
-      const step = (-2 * Math.PI) / size;
+      const step = N / size;
       for (let i = 0; i < N; i += size) {
         for (let k = 0; k < half; k++) {
-          const angle = k * step;
-          const cos = Math.cos(angle);
-          const sin = Math.sin(angle);
-          const oddIdx = i + k + half;
-          const tReal = cos * this.real[oddIdx] - sin * this.imag[oddIdx];
-          const tImag = sin * this.real[oddIdx] + cos * this.imag[oddIdx];
-          this.real[oddIdx] = this.real[i + k] - tReal;
-          this.imag[oddIdx] = this.imag[i + k] - tImag;
-          this.real[i + k] += tReal;
-          this.imag[i + k] += tImag;
+          const twIdx = k * step;
+          const cos = this.twCos[twIdx];
+          const sin = this.twSin[twIdx];
+          const evenIdx = i + k;
+          const oddIdx = evenIdx + half;
+          const or = this.real[oddIdx];
+          const oi = this.imag[oddIdx];
+          const tReal = cos * or - sin * oi;
+          const tImag = sin * or + cos * oi;
+          this.real[oddIdx] = this.real[evenIdx] - tReal;
+          this.imag[oddIdx] = this.imag[evenIdx] - tImag;
+          this.real[evenIdx] += tReal;
+          this.imag[evenIdx] += tImag;
         }
       }
     }
@@ -286,12 +432,13 @@ class OfflineAudioAnalyzer {
     let bassSum = 0;
     let midSum = 0;
     let highSum = 0;
+    const invNorm = 1 / (N * 0.25);
 
     for (let k = 0; k < 128; k++) {
-      const mag =
-        Math.sqrt(this.real[k] * this.real[k] + this.imag[k] * this.imag[k]) /
-        (N * 0.25);
-      const dbScaled = Math.max(0, Math.min(1, Math.pow(mag, 0.55)));
+      const r = this.real[k];
+      const im = this.imag[k];
+      const mag = Math.sqrt(r * r + im * im) * invNorm;
+      const dbScaled = mag <= 0 ? 0 : Math.min(1, Math.pow(mag, 0.55));
       this.frequencies[k] = Math.round(dbScaled * 255);
       if (k < 10) bassSum += dbScaled;
       else if (k < 44) midSum += dbScaled;
@@ -311,9 +458,10 @@ class OfflineAudioAnalyzer {
 }
 
 /**
- * Draws the exact Fullscreen Player Stage shown in Lumina Music:
- * - Left half: Stationary rounded-square album cover + Title + Composer/Artist ONLY + Progress bar + Transport icons
+ * Draws the Clean Exported Stage:
+ * - Left half: Stationary rounded-square album cover + Title + Composer/Artist + Progress bar (NO prev/pause/next buttons)
  * - Right half: Unboxed 3-Line Real-Time Synced Lyrics (`FullscreenThreeLineLyrics`) matching exact font preset & glow
+ * Uses offscreen caches for static cover/shadows, radial fluid textures, and steady-state lyrics for high-speed 720p-2160p export.
  */
 class StageCanvasPainter {
   private canvas: HTMLCanvasElement;
@@ -329,6 +477,20 @@ class StageCanvasPainter {
   private showBilingual: boolean;
   private fontStack: string;
   private hasMvVideo: boolean;
+
+  // Offscreen performance caches
+  private staticBgCanvas: HTMLCanvasElement | null = null;
+  private blob1Canvas: HTMLCanvasElement | null = null;
+  private blob2Canvas: HTMLCanvasElement | null = null;
+  private staticLeftCanvas: HTMLCanvasElement;
+  private thumbDotCanvas: HTMLCanvasElement;
+  private readonly thumbDotHalfSize: number;
+  private barFillGrad: CanvasGradient;
+  private lyricsCacheCanvas: HTMLCanvasElement;
+  private lyricsCacheCtx: CanvasRenderingContext2D;
+  private readonly lyricsCacheX: number;
+  private cachedLyricsKey: string | null = null;
+  private lastPreviewMirrorMs = -1000;
 
   constructor(params: {
     width: number;
@@ -353,155 +515,120 @@ class StageCanvasPainter {
     this.canvas = document.createElement('canvas');
     this.canvas.width = this.width;
     this.canvas.height = this.height;
-    const ctx = this.canvas.getContext('2d');
+    const ctx = this.canvas.getContext('2d', { alpha: false });
     if (!ctx) throw new Error('无法初始化 2D 渲染画布');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     this.ctx = ctx;
 
     this.parsed = parseLrc(this.track.lyricsRaw);
+
+    if (!this.hasMvVideo) {
+      this.initBackdropCaches();
+    }
+
+    this.staticLeftCanvas = this.buildStaticLeftDeckCache();
+
+    // Pre-render progress thumb + glow once to avoid per-frame shadowBlur filter overhead
+    const dotSize = Math.max(32, Math.ceil(48 * this.s));
+    this.thumbDotHalfSize = dotSize / 2;
+    this.thumbDotCanvas = document.createElement('canvas');
+    this.thumbDotCanvas.width = dotSize;
+    this.thumbDotCanvas.height = dotSize;
+    const dCtx = this.thumbDotCanvas.getContext('2d');
+    if (dCtx) {
+      dCtx.save();
+      dCtx.shadowColor = this.palette.primary;
+      dCtx.shadowBlur = 12 * this.s;
+      dCtx.beginPath();
+      dCtx.arc(this.thumbDotHalfSize, this.thumbDotHalfSize, 8 * this.s, 0, Math.PI * 2);
+      dCtx.fillStyle = '#ffffff';
+      dCtx.fill();
+      dCtx.restore();
+    }
+
+    const barW = Math.min(390 * this.s, this.width * 0.32);
+    const barX = this.width * 0.25 - barW / 2;
+    this.barFillGrad = this.ctx.createLinearGradient(barX, 0, barX + barW, 0);
+    this.barFillGrad.addColorStop(0, this.palette.primary);
+    this.barFillGrad.addColorStop(1, this.palette.secondary);
+
+    this.lyricsCacheX = Math.floor(this.width * 0.48);
+    this.lyricsCacheCanvas = document.createElement('canvas');
+    this.lyricsCacheCanvas.width = this.width - this.lyricsCacheX;
+    this.lyricsCacheCanvas.height = this.height;
+    const lCtx = this.lyricsCacheCanvas.getContext('2d');
+    if (!lCtx) throw new Error('无法初始化歌词缓存画布');
+    lCtx.imageSmoothingEnabled = true;
+    lCtx.imageSmoothingQuality = 'high';
+    this.lyricsCacheCtx = lCtx;
   }
 
-  getCanvas(): HTMLCanvasElement {
-    return this.canvas;
+  private initBackdropCaches(): void {
+    const W = this.width;
+    const H = this.height;
+    const c = this.fluidColors;
+
+    const bg = document.createElement('canvas');
+    bg.width = W;
+    bg.height = H;
+    const bCtx = bg.getContext('2d', { alpha: false });
+    if (bCtx) {
+      const [ar, ag, ab] = c.abyssRgb.map((v) => Math.round(v * 0.45));
+      const [dr, dg, db] = c.deepRgb.map((v) => Math.round(v * 0.55));
+      const baseGrad = bCtx.createLinearGradient(0, 0, W, H);
+      baseGrad.addColorStop(0, `rgb(${ar}, ${ag}, ${ab})`);
+      baseGrad.addColorStop(0.5, `rgb(${dr}, ${dg}, ${db})`);
+      baseGrad.addColorStop(1, `rgb(${ar}, ${ag}, ${ab})`);
+      bCtx.fillStyle = baseGrad;
+      bCtx.fillRect(0, 0, W, H);
+      this.staticBgCanvas = bg;
+    }
+
+    const makeBlob = (rgb: [number, number, number]): HTMLCanvasElement => {
+      const size = 512;
+      const half = size / 2;
+      const cv = document.createElement('canvas');
+      cv.width = size;
+      cv.height = size;
+      const gCtx = cv.getContext('2d');
+      if (gCtx) {
+        const rr = Math.round(rgb[0]);
+        const rg = Math.round(rgb[1]);
+        const rb = Math.round(rgb[2]);
+        const g = gCtx.createRadialGradient(half, half, 0, half, half, half);
+        g.addColorStop(0, `rgba(${rr}, ${rg}, ${rb}, 1)`);
+        g.addColorStop(0.5, `rgba(${rr}, ${rg}, ${rb}, 0.32)`);
+        g.addColorStop(1, `rgba(${rr}, ${rg}, ${rb}, 0)`);
+        gCtx.fillStyle = g;
+        gCtx.fillRect(0, 0, size, size);
+      }
+      return cv;
+    };
+
+    this.blob1Canvas = makeBlob(c.silkRgb);
+    this.blob2Canvas = makeBlob(c.secondaryRgb);
   }
 
-  getLines(): LyricLine[] {
-    return this.parsed.lines;
-  }
-
-  getHasSynced(): boolean {
-    return this.parsed.hasSyncedTimestamps;
-  }
-
-  drawFrame(
-    state: StageDrawContextState,
-    mvVideoEl?: HTMLVideoElement | null,
-    previewCanvas?: HTMLCanvasElement | null
-  ) {
-    const ctx = this.ctx;
+  private buildStaticLeftDeckCache(): HTMLCanvasElement {
     const W = this.width;
     const H = this.height;
     const s = this.s;
-
-    ctx.clearRect(0, 0, W, H);
-
-    // 1. Background: Deep cinematic black/fluid backdrop matching fullscreen mode
-    this.drawBackdrop(ctx, W, H, state);
-
-    // 2. MV Theater Video Layer (when MV video is present)
-    if (mvVideoEl && mvVideoEl.readyState >= 2) {
-      try {
-        const vw = mvVideoEl.videoWidth || W;
-        const vh = mvVideoEl.videoHeight || H;
-        const scale = Math.max(W / vw, H / vh);
-        const dw = vw * scale;
-        const dh = vh * scale;
-        const dx = (W - dw) / 2;
-        const dy = (H - dh) / 2;
-
-        ctx.save();
-        ctx.globalAlpha = 1;
-        ctx.drawImage(mvVideoEl, dx, dy, dw, dh);
-        ctx.restore();
-      } catch {
-        // Fallback silently if external CORS frame blocks drawImage
-      }
-    }
-
-    // 3. Fullscreen 50/50 Split Player Stage (fades smoothly with uiOpacity during MV intro/mid-break/outro)
-    if (state.uiOpacity > 0.01) {
-      ctx.save();
-      ctx.globalAlpha = Math.max(0, Math.min(1, state.uiOpacity));
-
-      this.drawLeftFullscreenDeck(ctx, W, H, s, state);
-      this.drawRightThreeLineLyrics(ctx, W, H, s, state);
-
-      ctx.restore();
-    }
-
-    // 4. Mirror live composition onto on-screen preview canvas
-    if (previewCanvas) {
-      const pCtx = previewCanvas.getContext('2d');
-      if (pCtx) {
-        if (previewCanvas.width !== W || previewCanvas.height !== H) {
-          previewCanvas.width = W;
-          previewCanvas.height = H;
-        }
-        pCtx.clearRect(0, 0, W, H);
-        pCtx.drawImage(this.canvas, 0, 0);
-      }
-    }
-  }
-
-  private drawBackdrop(
-    ctx: CanvasRenderingContext2D,
-    W: number,
-    H: number,
-    state: StageDrawContextState
-  ) {
-    if (this.hasMvVideo) {
-      ctx.fillStyle = '#000000';
-      ctx.fillRect(0, 0, W, H);
-      return;
-    }
-
-    // Matching dark fluid glow backdrop when no MV is playing
-    const c = this.fluidColors;
-    const t = state.timeSec;
-    const [ar, ag, ab] = c.abyssRgb.map((v) => Math.round(v * 0.45));
-    const [dr, dg, db] = c.deepRgb.map((v) => Math.round(v * 0.55));
-
-    const baseGrad = ctx.createLinearGradient(0, 0, W, H);
-    baseGrad.addColorStop(0, `rgb(${ar}, ${ag}, ${ab})`);
-    baseGrad.addColorStop(0.5, `rgb(${dr}, ${dg}, ${db})`);
-    baseGrad.addColorStop(1, `rgb(${ar}, ${ag}, ${ab})`);
-    ctx.fillStyle = baseGrad;
-    ctx.fillRect(0, 0, W, H);
-
-    const blobs = [
-      {
-        cx: W * (0.22 + Math.sin(t * 0.21) * 0.08),
-        cy: H * (0.26 + Math.cos(t * 0.19) * 0.08),
-        r: Math.max(W, H) * (0.48 + state.smoothBass * 0.06),
-        rgb: c.silkRgb,
-        alpha: 0.24 + state.smoothVol * 0.08,
-      },
-      {
-        cx: W * (0.78 + Math.cos(t * 0.18) * 0.08),
-        cy: H * (0.74 + Math.sin(t * 0.22) * 0.08),
-        r: Math.max(W, H) * (0.46 + state.smoothMid * 0.05),
-        rgb: c.secondaryRgb,
-        alpha: 0.2 + state.smoothVol * 0.07,
-      },
-    ];
-
-    for (const b of blobs) {
-      const rr = Math.round(b.rgb[0]);
-      const rg = Math.round(b.rgb[1]);
-      const rb = Math.round(b.rgb[2]);
-      const g = ctx.createRadialGradient(b.cx, b.cy, 0, b.cx, b.cy, b.r);
-      g.addColorStop(0, `rgba(${rr}, ${rg}, ${rb}, ${b.alpha.toFixed(3)})`);
-      g.addColorStop(0.5, `rgba(${rr}, ${rg}, ${rb}, ${(b.alpha * 0.32).toFixed(3)})`);
-      g.addColorStop(1, `rgba(${rr}, ${rg}, ${rb}, 0)`);
-      ctx.fillStyle = g;
-      ctx.fillRect(0, 0, W, H);
-    }
-  }
-
-  private drawLeftFullscreenDeck(
-    ctx: CanvasRenderingContext2D,
-    W: number,
-    H: number,
-    s: number,
-    state: StageDrawContextState
-  ) {
-    // Left 50% center (matching grid-cols-2 in PlayerPage fullscreen)
     const cx = W * 0.25;
-    const coverSize = Math.round(Math.min(H * 0.38, W * 0.225)); // ~274px at 720p, ~410px at 1080p
+    const coverSize = Math.round(Math.min(H * 0.38, W * 0.225));
     const coverX = cx - coverSize / 2;
     const coverY = H * 0.175;
     const cornerRadius = 26 * s;
 
-    // 1. Stationary Square Album Cover (`FullscreenCoverFluidStage.tsx`)
+    const cv = document.createElement('canvas');
+    cv.width = Math.ceil(W * 0.52);
+    cv.height = H;
+    const ctx = cv.getContext('2d');
+    if (!ctx) return cv;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+
+    // 1. Stationary Square Album Cover + Drop Shadow (rendered once!)
     ctx.save();
     ctx.shadowColor = 'rgba(0, 0, 0, 0.72)';
     ctx.shadowBlur = 46 * s;
@@ -536,7 +663,7 @@ class StageCanvasPainter {
     }
     ctx.restore();
 
-    // 2. Song Title + Composer/Artist ONLY (removed album & format/bitrate/sampleRate)
+    // 2. Song Title + Composer/Artist
     const titleY = coverY + coverSize + 30 * s;
     ctx.save();
     ctx.textAlign = 'center';
@@ -557,7 +684,169 @@ class StageCanvasPainter {
     }
     ctx.restore();
 
-    // 3. Lower Progress Bar + Timecodes + Transport Icons (matching PlayerPage fullscreen)
+    return cv;
+  }
+
+  getCanvas(): HTMLCanvasElement {
+    return this.canvas;
+  }
+
+  getLines(): LyricLine[] {
+    return this.parsed.lines;
+  }
+
+  getHasSynced(): boolean {
+    return this.parsed.hasSyncedTimestamps;
+  }
+
+  dispose(): void {
+    const releaseCanvas = (cv: HTMLCanvasElement | null) => {
+      if (!cv) return;
+      try {
+        cv.width = 0;
+        cv.height = 0;
+      } catch {
+        // ignore
+      }
+    };
+    releaseCanvas(this.canvas);
+    releaseCanvas(this.staticBgCanvas);
+    releaseCanvas(this.blob1Canvas);
+    releaseCanvas(this.blob2Canvas);
+    releaseCanvas(this.staticLeftCanvas);
+    releaseCanvas(this.thumbDotCanvas);
+    releaseCanvas(this.lyricsCacheCanvas);
+    this.staticBgCanvas = null;
+    this.blob1Canvas = null;
+    this.blob2Canvas = null;
+    this.coverImg = null;
+  }
+
+  drawFrame(
+    state: StageDrawContextState,
+    mvVideoEl?: HTMLVideoElement | null,
+    previewCanvas?: HTMLCanvasElement | null,
+    forcePreview = false
+  ) {
+    const ctx = this.ctx;
+    const W = this.width;
+    const H = this.height;
+    const s = this.s;
+
+    // 1. Background: Deep cinematic black/fluid backdrop matching fullscreen mode
+    // Skip expensive full-canvas black clear when an opaque full-bleed MV frame covers 100% of pixels
+    if (!this.hasMvVideo || !mvVideoEl || mvVideoEl.readyState < 2) {
+      this.drawBackdrop(ctx, W, H, state);
+    }
+
+    // 2. MV Theater Video Layer (when MV video is present)
+    if (mvVideoEl && mvVideoEl.readyState >= 2) {
+      try {
+        const vw = mvVideoEl.videoWidth || W;
+        const vh = mvVideoEl.videoHeight || H;
+        const scale = Math.max(W / vw, H / vh);
+        const dw = vw * scale;
+        const dh = vh * scale;
+        const dx = (W - dw) / 2;
+        const dy = (H - dh) / 2;
+
+        ctx.drawImage(mvVideoEl, dx, dy, dw, dh);
+      } catch {
+        // Fallback silently if external CORS frame blocks drawImage
+      }
+    }
+
+    // 3. Fullscreen 50/50 Split Player Stage (fades smoothly with uiOpacity during MV intro/mid-break/outro)
+    if (state.uiOpacity > 0.01) {
+      const clampedAlpha = Math.max(0, Math.min(1, state.uiOpacity));
+      const needsAlpha = clampedAlpha < 0.999;
+      if (needsAlpha) {
+        ctx.save();
+        ctx.globalAlpha = clampedAlpha;
+      }
+
+      this.drawLeftFullscreenDeck(ctx, W, H, s, state);
+      this.drawRightThreeLineLyrics(ctx, W, H, s, state);
+
+      if (needsAlpha) {
+        ctx.restore();
+      }
+    }
+
+    // 4. Mirror live composition onto on-screen preview canvas (throttled & downscaled for speed!)
+    if (previewCanvas) {
+      const nowMs = performance.now();
+      if (forcePreview || nowMs - this.lastPreviewMirrorMs >= 100) {
+        this.lastPreviewMirrorMs = nowMs;
+        const previewW = Math.min(W, 960);
+        const previewH = Math.round((previewW * H) / W);
+        if (previewCanvas.width !== previewW || previewCanvas.height !== previewH) {
+          previewCanvas.width = previewW;
+          previewCanvas.height = previewH;
+        }
+        const pCtx = previewCanvas.getContext('2d');
+        if (pCtx) {
+          pCtx.imageSmoothingEnabled = true;
+          pCtx.imageSmoothingQuality = 'high';
+          pCtx.drawImage(this.canvas, 0, 0, previewW, previewH);
+        }
+      }
+    }
+  }
+
+  private drawBackdrop(
+    ctx: CanvasRenderingContext2D,
+    W: number,
+    H: number,
+    state: StageDrawContextState
+  ) {
+    if (this.hasMvVideo) {
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, W, H);
+      return;
+    }
+
+    if (this.staticBgCanvas) {
+      ctx.drawImage(this.staticBgCanvas, 0, 0);
+    } else {
+      ctx.fillStyle = '#0a0408';
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    const t = state.timeSec;
+    if (this.blob1Canvas) {
+      const cx1 = W * (0.22 + Math.sin(t * 0.21) * 0.08);
+      const cy1 = H * (0.26 + Math.cos(t * 0.19) * 0.08);
+      const r1 = Math.max(W, H) * (0.48 + state.smoothBass * 0.06);
+      ctx.save();
+      ctx.globalAlpha = 0.24 + state.smoothVol * 0.08;
+      ctx.drawImage(this.blob1Canvas, cx1 - r1, cy1 - r1, r1 * 2, r1 * 2);
+      ctx.restore();
+    }
+
+    if (this.blob2Canvas) {
+      const cx2 = W * (0.78 + Math.cos(t * 0.18) * 0.08);
+      const cy2 = H * (0.74 + Math.sin(t * 0.22) * 0.08);
+      const r2 = Math.max(W, H) * (0.46 + state.smoothMid * 0.05);
+      ctx.save();
+      ctx.globalAlpha = 0.2 + state.smoothVol * 0.07;
+      ctx.drawImage(this.blob2Canvas, cx2 - r2, cy2 - r2, r2 * 2, r2 * 2);
+      ctx.restore();
+    }
+  }
+
+  private drawLeftFullscreenDeck(
+    ctx: CanvasRenderingContext2D,
+    W: number,
+    H: number,
+    s: number,
+    state: StageDrawContextState
+  ) {
+    // 1. Pre-rendered stationary cover + drop shadow + title + composer/artist
+    ctx.drawImage(this.staticLeftCanvas, 0, 0);
+
+    // 2. Progress Bar + Timecodes ONLY (transport prev/pause/next buttons intentionally omitted)
+    const cx = W * 0.25;
     const barW = Math.min(390 * s, W * 0.32);
     const barX = cx - barW / 2;
     const barY = H * 0.785;
@@ -574,22 +863,16 @@ class StageCanvasPainter {
     if (pct > 0) {
       const fillW = Math.max(barH, barW * pct);
       drawRoundedRectPath(ctx, barX, barY, fillW, barH, barH / 2);
-      const fillGrad = ctx.createLinearGradient(barX, 0, barX + barW, 0);
-      fillGrad.addColorStop(0, this.palette.primary);
-      fillGrad.addColorStop(1, this.palette.secondary);
-      ctx.fillStyle = fillGrad;
+      ctx.fillStyle = this.barFillGrad;
       ctx.fill();
     }
 
     const thumbX = barX + barW * pct;
-    ctx.save();
-    ctx.shadowColor = this.palette.primary;
-    ctx.shadowBlur = 12 * s;
-    ctx.beginPath();
-    ctx.arc(thumbX, barY + barH / 2, 8 * s, 0, Math.PI * 2);
-    ctx.fillStyle = '#ffffff';
-    ctx.fill();
-    ctx.restore();
+    ctx.drawImage(
+      this.thumbDotCanvas,
+      thumbX - this.thumbDotHalfSize,
+      barY + barH / 2 - this.thumbDotHalfSize
+    );
 
     ctx.save();
     ctx.font = `400 ${Math.round(11 * s)}px ${MONO_STACK}`;
@@ -600,51 +883,6 @@ class StageCanvasPainter {
     ctx.textAlign = 'right';
     ctx.fillText(formatTime(state.audioDuration), barX + barW, barY + 14 * s);
     ctx.restore();
-
-    // Subtle transport controls beneath scrubber matching Image 2
-    const ctrlY = barY + 54 * s;
-    const iconSpread = 86 * s;
-    this.drawTransportPrevIcon(ctx, cx - iconSpread, ctrlY, 10 * s);
-    this.drawTransportPauseIcon(ctx, cx, ctrlY, 10.5 * s);
-    this.drawTransportNextIcon(ctx, cx + iconSpread, ctrlY, 10 * s);
-  }
-
-  private drawTransportPrevIcon(ctx: CanvasRenderingContext2D, x: number, y: number, r: number) {
-    ctx.save();
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.82)';
-    ctx.fillRect(x - r, y - r * 0.85, r * 0.25, r * 1.7);
-    ctx.beginPath();
-    ctx.moveTo(x - r * 0.55, y);
-    ctx.lineTo(x + r * 0.9, y - r * 0.85);
-    ctx.lineTo(x + r * 0.9, y + r * 0.85);
-    ctx.closePath();
-    ctx.fill();
-    ctx.restore();
-  }
-
-  private drawTransportPauseIcon(ctx: CanvasRenderingContext2D, x: number, y: number, r: number) {
-    ctx.save();
-    ctx.fillStyle = '#ffffff';
-    const barW = r * 0.34;
-    const gap = r * 0.34;
-    drawRoundedRectPath(ctx, x - gap - barW, y - r * 0.9, barW, r * 1.8, 1.5);
-    ctx.fill();
-    drawRoundedRectPath(ctx, x + gap, y - r * 0.9, barW, r * 1.8, 1.5);
-    ctx.fill();
-    ctx.restore();
-  }
-
-  private drawTransportNextIcon(ctx: CanvasRenderingContext2D, x: number, y: number, r: number) {
-    ctx.save();
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.82)';
-    ctx.fillRect(x + r * 0.75, y - r * 0.85, r * 0.25, r * 1.7);
-    ctx.beginPath();
-    ctx.moveTo(x + r * 0.55, y);
-    ctx.lineTo(x - r * 0.9, y - r * 0.85);
-    ctx.lineTo(x - r * 0.9, y + r * 0.85);
-    ctx.closePath();
-    ctx.fill();
-    ctx.restore();
   }
 
   private drawRightThreeLineLyrics(
@@ -654,8 +892,51 @@ class StageCanvasPainter {
     s: number,
     state: StageDrawContextState
   ) {
-    // Right half unboxed 3-line lyrics matching Image 2 & FullscreenThreeLineLyrics.tsx
-    const xStart = W * 0.53;
+    const activeIdx = this.parsed.hasSyncedTimestamps ? state.activeIdx : 0;
+    const animDur = 0.54;
+    const isAnimating =
+      this.parsed.lines.length > 0 &&
+      state.stepDirection !== 'none' &&
+      state.lineTransitionElapsedSec < animDur + 0.095;
+
+    // Fast path: blit cached steady-state lyrics canvas (eliminates heavy shadowBlur & text layout on ~90% of frames)
+    if (!isAnimating) {
+      const cacheKey = this.parsed.lines.length === 0 ? 'empty' : `steady:${activeIdx}`;
+      if (this.cachedLyricsKey !== cacheKey) {
+        this.lyricsCacheCtx.clearRect(
+          0,
+          0,
+          this.lyricsCacheCanvas.width,
+          this.lyricsCacheCanvas.height
+        );
+        this.renderLyricsIntoContext(
+          this.lyricsCacheCtx,
+          W,
+          H,
+          s,
+          state,
+          -this.lyricsCacheX,
+          false
+        );
+        this.cachedLyricsKey = cacheKey;
+      }
+      ctx.drawImage(this.lyricsCacheCanvas, this.lyricsCacheX, 0);
+      return;
+    }
+
+    this.renderLyricsIntoContext(ctx, W, H, s, state, 0, true);
+  }
+
+  private renderLyricsIntoContext(
+    ctx: CanvasRenderingContext2D,
+    W: number,
+    H: number,
+    s: number,
+    state: StageDrawContextState,
+    offsetX: number,
+    withEntranceAnim: boolean
+  ) {
+    const xStart = W * 0.53 + offsetX;
     const maxTextWidth = W * 0.41;
     const centerY = H * 0.5;
 
@@ -732,18 +1013,21 @@ class StageCanvasPainter {
       const targetScale = isCurrent ? 1.02 : slot.role === 'prev' ? 0.96 : 0.97;
       const targetShiftX = isCurrent ? 6 * s : 0;
 
-      // Smooth flowing entrance curve identical to FullscreenThreeLineLyrics CSS animation
       let animT = 1;
-      if (state.stepDirection !== 'none' && state.lineTransitionElapsedSec < animDur + slot.staggerSec) {
+      if (
+        withEntranceAnim &&
+        state.stepDirection !== 'none' &&
+        state.lineTransitionElapsedSec < animDur + slot.staggerSec
+      ) {
         const localElapsed = Math.max(0, state.lineTransitionElapsedSec - slot.staggerSec);
         animT = cubicBezierEaseOut(localElapsed / animDur);
       }
 
       const dirSign = state.stepDirection === 'backward' ? -1 : 1;
-      const enterOffsetY =
-        state.stepDirection === 'none' ? 0 : dirSign * 24 * s * (1 - animT);
-      const enterScale = state.stepDirection === 'none' ? 1 : 0.968 + 0.032 * animT;
-      const enterAlpha = state.stepDirection === 'none' ? 1 : 0.12 + 0.88 * animT;
+      const useAnim = withEntranceAnim && state.stepDirection !== 'none';
+      const enterOffsetY = useAnim ? dirSign * 24 * s * (1 - animT) : 0;
+      const enterScale = useAnim ? 0.968 + 0.032 * animT : 1;
+      const enterAlpha = useAnim ? 0.12 + 0.88 * animT : 1;
 
       const slotOpacity = targetOpacity * enterAlpha;
       const slotScale = targetScale * enterScale;
@@ -784,7 +1068,6 @@ class StageCanvasPainter {
           ctx.shadowBlur = 30 * s;
           ctx.fillStyle = '#ffffff';
           ctx.fillText(row, 0, cursorY);
-          // Second crisp shadow pass matching CSS double text-shadow
           ctx.shadowColor = 'rgba(0, 0, 0, 0.88)';
           ctx.shadowBlur = 16 * s;
           ctx.shadowOffsetY = 4 * s;
@@ -862,18 +1145,32 @@ async function probeWebCodecsSupport(
     return null;
   }
 
-  const targetBitrate =
-    width >= 1920
-      ? fps >= 100
-        ? 14_000_000
-        : 10_000_000
-      : fps >= 100
-      ? 9_000_000
-      : 6_500_000;
+  const targetBitrate = getTargetBitrate(width, fps);
+  const audioBitrate = 256_000;
 
-  // Higher H.264 levels (5.2, 5.0, 4.2) are required for 60–120fps encoding in WebCodecs
+  // Check audio support once per codec
+  const [aacSup, opusSup] = await Promise.all([
+    AudioEncoder.isConfigSupported({
+      codec: 'mp4a.40.2',
+      numberOfChannels: 2,
+      sampleRate,
+      bitrate: audioBitrate,
+    }).catch(() => ({ supported: false })),
+    AudioEncoder.isConfigSupported({
+      codec: 'opus',
+      numberOfChannels: 2,
+      sampleRate: 48000,
+      bitrate: audioBitrate,
+    }).catch(() => ({ supported: false })),
+  ]);
+
+  // Higher H.264 levels (6.2, 6.1, 6.0, 5.2, 5.1, 5.0, 4.2) support 720p..2160p@30-120fps
   const avcCandidates = [
-    'avc1.640034', // High Profile Level 5.2 (supports up to 1080p@120fps+)
+    'avc1.64003e', // High Profile Level 6.2 (2160p@120fps)
+    'avc1.64003d', // High Profile Level 6.1
+    'avc1.64003c', // High Profile Level 6.0 (2160p@60fps+)
+    'avc1.640034', // High Profile Level 5.2 (2160p@60fps / 1080p@120fps)
+    'avc1.640033', // High Profile Level 5.1 (1440p@60fps)
     'avc1.640032', // High Profile Level 5.0
     'avc1.4d0032', // Main Profile Level 5.0
     'avc1.64002a', // High Profile Level 4.2 (1080p@60fps)
@@ -881,60 +1178,92 @@ async function probeWebCodecsSupport(
     'avc1.4d001f', // Main Profile Level 3.1
   ];
 
-  for (const avcCodec of avcCandidates) {
-    try {
-      const vSup = await VideoEncoder.isConfigSupported({
-        codec: avcCodec,
-        width,
-        height,
-        bitrate: targetBitrate,
-        framerate: fps,
-      });
-      const aSup = await AudioEncoder.isConfigSupported({
-        codec: 'mp4a.40.2',
-        numberOfChannels: 2,
-        sampleRate,
-        bitrate: 192_000,
-      });
-      if (vSup.supported && aSup.supported) {
-        return {
-          container: 'mp4' as const,
-          videoCodec: avcCodec,
-          audioCodec: 'mp4a.40.2',
-          bitrate: targetBitrate,
-        };
+  // Strictly prioritize 'quality' latencyMode + VBR for stutter-free frame pacing and crisp visuals
+  const encoderProfiles: Array<{
+    hardwareAcceleration: HardwareAcceleration;
+    latencyMode?: LatencyMode;
+    bitrateMode?: VideoEncoderBitrateMode;
+  }> = [
+    { hardwareAcceleration: 'prefer-hardware', latencyMode: 'quality', bitrateMode: 'variable' },
+    { hardwareAcceleration: 'prefer-hardware', latencyMode: 'quality' },
+    { hardwareAcceleration: 'prefer-hardware' },
+    { hardwareAcceleration: 'no-preference', latencyMode: 'quality', bitrateMode: 'variable' },
+    { hardwareAcceleration: 'no-preference', latencyMode: 'quality' },
+    { hardwareAcceleration: 'no-preference' },
+  ];
+
+  if (aacSup.supported) {
+    for (const profile of encoderProfiles) {
+      for (const avcCodec of avcCandidates) {
+        try {
+          const vSup = await VideoEncoder.isConfigSupported({
+            codec: avcCodec,
+            width,
+            height,
+            bitrate: targetBitrate,
+            framerate: fps,
+            hardwareAcceleration: profile.hardwareAcceleration,
+            ...(profile.latencyMode ? { latencyMode: profile.latencyMode } : {}),
+            ...(profile.bitrateMode ? { bitrateMode: profile.bitrateMode } : {}),
+          });
+          if (vSup.supported) {
+            return {
+              container: 'mp4' as const,
+              videoCodec: avcCodec,
+              audioCodec: 'mp4a.40.2',
+              bitrate: targetBitrate,
+              audioBitrate,
+              hardwareAcceleration: profile.hardwareAcceleration,
+              latencyMode: profile.latencyMode,
+              bitrateMode: profile.bitrateMode,
+            };
+          }
+        } catch {
+          // try next
+        }
       }
-    } catch {
-      // try next
     }
   }
 
-  // Fallback to WebM (VP9 Level 5.0 / VP8 + Opus)
-  for (const vpCodec of ['vp09.00.50.08', 'vp09.00.41.08', 'vp8']) {
-    try {
-      const vSup = await VideoEncoder.isConfigSupported({
-        codec: vpCodec,
-        width,
-        height,
-        bitrate: targetBitrate,
-        framerate: fps,
-      });
-      const aSup = await AudioEncoder.isConfigSupported({
-        codec: 'opus',
-        numberOfChannels: 2,
-        sampleRate: 48000,
-        bitrate: 192_000,
-      });
-      if (vSup.supported && aSup.supported) {
-        return {
-          container: 'webm' as const,
-          videoCodec: vpCodec,
-          audioCodec: 'opus',
-          bitrate: targetBitrate,
-        };
+  // Fallback to WebM (VP9 Level 6.1 / 6.0 / 5.1 / 5.0 / VP8 + Opus)
+  if (opusSup.supported) {
+    const vpCandidates = [
+      'vp09.00.61.08',
+      'vp09.00.60.08',
+      'vp09.00.51.08',
+      'vp09.00.50.08',
+      'vp09.00.41.08',
+      'vp8',
+    ];
+    for (const profile of encoderProfiles) {
+      for (const vpCodec of vpCandidates) {
+        try {
+          const vSup = await VideoEncoder.isConfigSupported({
+            codec: vpCodec,
+            width,
+            height,
+            bitrate: targetBitrate,
+            framerate: fps,
+            hardwareAcceleration: profile.hardwareAcceleration,
+            ...(profile.latencyMode ? { latencyMode: profile.latencyMode } : {}),
+            ...(profile.bitrateMode ? { bitrateMode: profile.bitrateMode } : {}),
+          });
+          if (vSup.supported) {
+            return {
+              container: 'webm' as const,
+              videoCodec: vpCodec,
+              audioCodec: 'opus',
+              bitrate: targetBitrate,
+              audioBitrate,
+              hardwareAcceleration: profile.hardwareAcceleration,
+              latencyMode: profile.latencyMode,
+              bitrateMode: profile.bitrateMode,
+            };
+          }
+        } catch {
+          // try next
+        }
       }
-    } catch {
-      // try next
     }
   }
 
@@ -948,13 +1277,310 @@ function resampleStereoAudioBuffer(
   if (source.sampleRate === targetSampleRate && source.numberOfChannels >= 2) {
     return Promise.resolve(source);
   }
-  const length = Math.ceil(source.duration * targetSampleRate);
+  const length = Math.max(1, Math.ceil(source.duration * targetSampleRate));
   const offline = new OfflineAudioContext(2, length, targetSampleRate);
   const srcNode = offline.createBufferSource();
   srcNode.buffer = source;
   srcNode.connect(offline.destination);
   srcNode.start(0);
   return offline.startRendering();
+}
+
+async function seekVideoExact(
+  videoEl: HTMLVideoElement,
+  targetSec: number
+): Promise<void> {
+  if (!Number.isFinite(targetSec)) return;
+  const maxDur =
+    Number.isFinite(videoEl.duration) && videoEl.duration > 0
+      ? videoEl.duration
+      : targetSec;
+  const clamped = Math.max(0, Math.min(Math.max(0, maxDur - 0.015), targetSec));
+
+  if (
+    !videoEl.seeking &&
+    Math.abs(videoEl.currentTime - clamped) < 0.0005 &&
+    videoEl.readyState >= 2
+  ) {
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      videoEl.removeEventListener('seeked', onSeeked);
+      videoEl.removeEventListener('canplay', done);
+      videoEl.removeEventListener('error', done);
+      resolve();
+    };
+    const onSeeked = () => {
+      if (videoEl.readyState >= 2) {
+        done();
+      } else {
+        videoEl.addEventListener('canplay', done, { once: true });
+      }
+    };
+    const timer = window.setTimeout(done, 3000);
+    videoEl.addEventListener('seeked', onSeeked, { once: true });
+    videoEl.addEventListener('error', done, { once: true });
+    try {
+      videoEl.currentTime = clamped;
+    } catch {
+      done();
+    }
+  });
+}
+
+/**
+ * Advances an offscreen HTMLVideoElement sequentially using adaptive playbackRate (0.25x..4.0x)
+ * and zero-seek pause gating rather than flushing the decoder via per-frame `.currentTime` seeks.
+ * Achieves ~15x-30x faster rendering while staying tightly phase-locked to every output frame.
+ */
+class SequentialMvVideoReader {
+  private videoEl: HTMLVideoElement;
+  private maxSeekableSec: number;
+  private hasDoneInitialSeek = false;
+  private playPromise: Promise<void> | null = null;
+
+  constructor(videoEl: HTMLVideoElement, fallbackDurSec: number) {
+    this.videoEl = videoEl;
+    const rawDur =
+      Number.isFinite(videoEl.duration) && videoEl.duration > 0
+        ? videoEl.duration
+        : fallbackDurSec;
+    this.maxSeekableSec = Math.max(0, rawDur - 0.02);
+  }
+
+  private safePlay() {
+    if (!this.videoEl.paused || this.videoEl.ended || this.playPromise) return;
+    const p = this.videoEl
+      .play()
+      .catch(() => {})
+      .finally(() => {
+        if (this.playPromise === p) this.playPromise = null;
+      });
+    this.playPromise = p;
+  }
+
+  private safePause() {
+    if (!this.videoEl.paused) {
+      try {
+        this.videoEl.pause();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  private tunePlaybackRate(measuredRenderFps: number, outputFps: number, diffSec: number) {
+    const baseRatio = Math.max(
+      0.25,
+      Math.min(4.0, measuredRenderFps / Math.max(1, outputFps))
+    );
+    // Smooth proportional servo around target time to avoid play/pause thrashing:
+    // ahead -> decelerate gently; behind -> accelerate gently.
+    let targetRate = baseRatio;
+    if (diffSec < -0.012) {
+      targetRate = baseRatio * 0.55;
+    } else if (diffSec > 0.035) {
+      targetRate = baseRatio * 1.45 + 0.25;
+    }
+    const clampedRate = Math.max(0.25, Math.min(4.0, targetRate));
+    if (Math.abs(this.videoEl.playbackRate - clampedRate) > 0.06) {
+      try {
+        this.videoEl.playbackRate = clampedRate;
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  async syncTo(
+    targetSec: number,
+    measuredRenderFps: number,
+    outputFps: number,
+    isCancelled: () => boolean
+  ): Promise<void> {
+    const clamped = Math.max(0, Math.min(this.maxSeekableSec, targetSec));
+
+    // Hold final frame cleanly once MV finishes (for MVs shorter than the song)
+    if (
+      this.hasDoneInitialSeek &&
+      clamped >= this.maxSeekableSec - 0.002 &&
+      Math.abs((this.videoEl.currentTime || 0) - this.maxSeekableSec) < 0.05
+    ) {
+      this.safePause();
+      return;
+    }
+
+    const cur = this.videoEl.currentTime || 0;
+    const diff = clamped - cur;
+
+    // 1. Initial frame OR large timeline jump (intro -> normal, mid-break jump, outro jump)
+    if (!this.hasDoneInitialSeek || diff < -0.18 || diff > 0.65) {
+      this.safePause();
+      await seekVideoExact(this.videoEl, clamped);
+      this.hasDoneInitialSeek = true;
+      return;
+    }
+
+    // 2. Hard pause only if video got > 55ms ahead of target
+    if (diff < -0.055) {
+      this.safePause();
+      return;
+    }
+
+    // 3. Video is already inside [-55ms .. +8ms] sync window -> zero-wait immediate frame!
+    if (diff <= 0.008 && this.videoEl.readyState >= 2) {
+      this.tunePlaybackRate(measuredRenderFps, outputFps, diff);
+      this.safePlay();
+      return;
+    }
+
+    // 4. Advance sequentially without flushing decoder keyframes
+    this.tunePlaybackRate(measuredRenderFps, outputFps, diff);
+    this.safePlay();
+
+    const deadline = performance.now() + 260;
+    while (
+      !isCancelled() &&
+      !this.videoEl.ended &&
+      (this.videoEl.currentTime || 0) < clamped - 0.008
+    ) {
+      if (performance.now() >= deadline) {
+        this.safePause();
+        await seekVideoExact(this.videoEl, clamped);
+        return;
+      }
+      await new Promise<void>((r) => setTimeout(r, 2));
+    }
+
+    if ((this.videoEl.currentTime || 0) > clamped + 0.055) {
+      this.safePause();
+    }
+  }
+}
+
+async function prepareOfflineMvAssets(mvRecord: TrackMvRecord): Promise<{
+  videoEl: HTMLVideoElement;
+  mvAudioBuffer: AudioBuffer | null;
+  dispose: () => void;
+} | null> {
+  let blobUrl: string | null = null;
+  const srcUrl = mvRecord.videoBlob
+    ? (blobUrl = URL.createObjectURL(mvRecord.videoBlob))
+    : mvRecord.externalUrl || '';
+
+  if (!srcUrl) return null;
+
+  const videoEl = document.createElement('video');
+  videoEl.muted = true;
+  videoEl.playsInline = true;
+  videoEl.preload = 'auto';
+  if (!mvRecord.videoBlob && mvRecord.sourceType === 'url') {
+    videoEl.crossOrigin = 'anonymous';
+  }
+  videoEl.style.position = 'fixed';
+  videoEl.style.left = '-9999px';
+  videoEl.style.top = '-9999px';
+  videoEl.style.width = '2px';
+  videoEl.style.height = '2px';
+  videoEl.style.opacity = '0.001';
+  videoEl.style.pointerEvents = 'none';
+  document.body.appendChild(videoEl);
+  videoEl.src = srcUrl;
+
+  const dispose = () => {
+    try {
+      videoEl.pause();
+      videoEl.removeAttribute('src');
+      videoEl.load();
+    } catch {
+      // ignore
+    }
+    try {
+      videoEl.remove();
+    } catch {
+      // ignore
+    }
+    if (blobUrl) {
+      URL.revokeObjectURL(blobUrl);
+    }
+  };
+
+  try {
+    const loadedOk = await new Promise<boolean>((resolve) => {
+      if (videoEl.readyState >= 2) return resolve(true);
+      let settled = false;
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        videoEl.removeEventListener('loadeddata', onData);
+        videoEl.removeEventListener('canplay', onData);
+        videoEl.removeEventListener('error', onErr);
+        resolve(ok);
+      };
+      const onData = () => finish(true);
+      const onErr = () => finish(false);
+      const timer = window.setTimeout(() => finish(videoEl.readyState >= 2), 12000);
+      videoEl.addEventListener('loadeddata', onData, { once: true });
+      videoEl.addEventListener('canplay', onData, { once: true });
+      videoEl.addEventListener('error', onErr, { once: true });
+    });
+
+    if (!loadedOk || videoEl.readyState < 2) {
+      dispose();
+      return null;
+    }
+
+    // Verify drawImage won't taint the canvas (external URL without CORS headers)
+    try {
+      const testCanvas = document.createElement('canvas');
+      testCanvas.width = 4;
+      testCanvas.height = 4;
+      const tCtx = testCanvas.getContext('2d');
+      if (tCtx) {
+        tCtx.drawImage(videoEl, 0, 0, 4, 4);
+        tCtx.getImageData(0, 0, 1, 1);
+      }
+    } catch {
+      dispose();
+      return null;
+    }
+
+    // Decode MV audio track if present (silent fallback if MV has no audio or CORS blocks fetch)
+    let mvAudioBuffer: AudioBuffer | null = null;
+    try {
+      let arrBuf: ArrayBuffer | null = null;
+      if (mvRecord.videoBlob) {
+        arrBuf = await mvRecord.videoBlob.arrayBuffer();
+      } else if (mvRecord.externalUrl) {
+        const res = await fetch(mvRecord.externalUrl);
+        if (res.ok) arrBuf = await res.arrayBuffer();
+      }
+      if (arrBuf && arrBuf.byteLength > 0) {
+        const mvDecodeCtx = new AudioContext();
+        try {
+          const decodedMv = await mvDecodeCtx.decodeAudioData(arrBuf);
+          arrBuf = null;
+          mvAudioBuffer = await resampleStereoAudioBuffer(decodedMv, 48000);
+        } finally {
+          await mvDecodeCtx.close().catch(() => {});
+        }
+      }
+    } catch {
+      mvAudioBuffer = null;
+    }
+
+    return { videoEl, mvAudioBuffer, dispose };
+  } catch {
+    dispose();
+    return null;
+  }
 }
 
 function pickBestMediaRecorderMime(): {
@@ -980,7 +1606,8 @@ function pickBestMediaRecorderMime(): {
 /**
  * Renders the exact Fullscreen Webpage Player Stage (Square non-rotating cover,
  * Title + Composer/Artist only, Unboxed 3-Line flowing synced lyrics in active font,
- * plus optional MV theater integration) at custom FPS (60-120) and custom time range.
+ * plus optional MV theater integration) at custom FPS (30-120) and custom time range.
+ * Always prefers deterministic offline WebCodecs rendering (including MV!) for zero-drop quality.
  */
 export function startStageVideoRender(
   options: StageRenderOptions
@@ -990,9 +1617,10 @@ export function startStageVideoRender(
   let monitorGainRef: GainNode | null = null;
   let isMonitorMuted = Boolean(options.monitorMuted ?? true);
 
-  const width = options.quality === '1080p' ? 1920 : 1280;
-  const height = options.quality === '1080p' ? 1080 : 720;
-  const fps = Math.max(60, Math.min(120, Math.round(options.fps || 60)));
+  const dims = QUALITY_DIMENSIONS[options.quality] || QUALITY_DIMENSIONS['720p'];
+  const width = dims.width;
+  const height = dims.height;
+  const fps = Math.max(30, Math.min(120, Math.round(options.fps || 60)));
   const requestedStartSec = Math.max(0, options.startOffsetSec || 0);
 
   const promise = (async (): Promise<StageRenderResult> => {
@@ -1009,6 +1637,727 @@ export function startStageVideoRender(
         (options.mvRecord.videoBlob || options.mvRecord.externalUrl)
     );
 
+    const codecSupport = await probeWebCodecsSupport(width, height, 48000, fps);
+
+    // Path A: Deterministic Offline Frame-by-Frame WebCodecs Render (Stage-only AND Stage + MV!)
+    // Exact constant frame timestamps + interleaved audio + quality rate-control = zero stutter.
+    if (codecSupport) {
+      let offlineMv: Awaited<ReturnType<typeof prepareOfflineMvAssets>> = null;
+      if (hasUsableMv && options.mvRecord) {
+        options.onProgress?.({
+          percent: 1,
+          elapsedSec: 0,
+          totalSec: Math.max(3, Math.round(options.track.duration || 30)),
+          phaseLabel: '正在准备 MV 视频流与高精度音频轨道...',
+          engineLabel: `WebCodecs ${codecSupport.container.toUpperCase()} · ${fps} fps`,
+        });
+        offlineMv = await prepareOfflineMvAssets(options.mvRecord);
+      }
+
+      // If MV was requested and offline canvas access was possible (or no MV was requested), run Path A
+      if (!hasUsableMv || offlineMv) {
+        const painter = new StageCanvasPainter({
+          width,
+          height,
+          track: options.track,
+          coverImg,
+          showBilingual: options.showBilingual,
+          fontPreset: options.fontPreset,
+          hasMvVideo: Boolean(offlineMv),
+        });
+        const parsedLines = painter.getLines();
+        const hasSynced = painter.getHasSynced();
+
+        let mp4Muxer: Mp4Muxer<Mp4StreamTarget> | null = null;
+        let webmMuxer: WebmMuxer<WebmStreamTarget> | null = null;
+        let videoEncoder: VideoEncoder | null = null;
+        let audioEncoder: AudioEncoder | null = null;
+        const sink = new PagedBlobSink();
+
+        try {
+          const decodeCtx = new AudioContext();
+          let decodedSongBuffer: AudioBuffer | null;
+          try {
+            const arrBuf = await options.audioBlob.arrayBuffer();
+            decodedSongBuffer = await decodeCtx.decodeAudioData(arrBuf);
+          } finally {
+            await decodeCtx.close().catch(() => {});
+          }
+
+          let songResampled: AudioBuffer | null = await resampleStereoAudioBuffer(
+            decodedSongBuffer,
+            48000
+          );
+          decodedSongBuffer = null;
+
+          const mvVideoEl = offlineMv?.videoEl || null;
+          let songAnalyzer: OfflineAudioAnalyzer | null = mvVideoEl
+            ? null
+            : new OfflineAudioAnalyzer(songResampled);
+
+          const songDuration = songResampled.duration || options.track.duration || 10;
+          const safeStart = Math.min(Math.max(0, songDuration - 1), requestedStartSec);
+
+          const timeline = options.mvRecord?.timeline || createDefaultMvTimeline();
+          const sortedBreaks = normalizeMidBreaks(timeline.midBreaks || []);
+          const mvDuration =
+            (mvVideoEl && Number.isFinite(mvVideoEl.duration) && mvVideoEl.duration > 0
+              ? mvVideoEl.duration
+              : options.mvRecord?.durationSec) || 0;
+
+          const hasIntro = Boolean(
+            mvVideoEl && safeStart <= 0.1 && timeline.introEnabled && timeline.introEndSec > 0.35
+          );
+          const completedBreaks = new Set<string>();
+          if (safeStart > 0.1 && mvVideoEl) {
+            for (const brk of sortedBreaks) {
+              if (safeStart > brk.audioTriggerSec + 0.15) {
+                completedBreaks.add(brk.id);
+              }
+            }
+          }
+
+          const introLen = hasIntro ? timeline.introEndSec : 0;
+          const breaksLen = mvVideoEl
+            ? sortedBreaks
+                .filter((b) => !completedBreaks.has(b.id))
+                .reduce((acc, b) => acc + (b.mvEndSec - b.mvStartSec), 0)
+            : 0;
+          const endSyncMv = computeSyncedMvTime(
+            songDuration,
+            timeline,
+            new Set(sortedBreaks.map((b) => b.id))
+          );
+          const outroEnd = timeline.outroEndSec || mvDuration;
+          const outroLen =
+            mvVideoEl && timeline.outroEnabled && outroEnd > endSyncMv + 0.4
+              ? outroEnd - endSyncMv
+              : 0;
+
+          const fullRemainingTheater =
+            introLen + Math.max(1, songDuration - safeStart) + breaksLen + outroLen;
+          const targetDuration =
+            options.clipDurationSec && options.clipDurationSec > 1
+              ? Math.min(fullRemainingTheater, options.clipDurationSec)
+              : fullRemainingTheater;
+
+          const totalFrames = Math.max(1, Math.ceil(targetDuration * fps));
+          let encodeError: Error | null = null;
+          const isMp4 = codecSupport.container === 'mp4';
+
+          if (isMp4) {
+            mp4Muxer = new Mp4Muxer({
+              target: new Mp4StreamTarget({
+                onData: (data, pos) => sink.write(pos, data),
+                chunked: false,
+              }),
+              video: { codec: 'avc', width, height, frameRate: fps },
+              audio: { codec: 'aac', numberOfChannels: 2, sampleRate: 48000 },
+              fastStart: false,
+              firstTimestampBehavior: 'cross-track-offset',
+            });
+          } else {
+            webmMuxer = new WebmMuxer({
+              target: new WebmStreamTarget({
+                onData: (data, pos) => sink.write(pos, data),
+                chunked: false,
+              }),
+              video: {
+                codec: codecSupport.videoCodec.startsWith('vp09') ? 'V_VP9' : 'V_VP8',
+                width,
+                height,
+                frameRate: fps,
+              },
+              audio: { codec: 'A_OPUS', numberOfChannels: 2, sampleRate: 48000 },
+              firstTimestampBehavior: 'offset',
+            });
+          }
+
+          // Monotonic DTS + non-negative CTS guard for hardware encoders emitting B-frames under quality latencyMode
+          const encodedVideoInputTsQueue: number[] = [];
+          const pendingVideoInitChunks: Array<{
+            chunk: EncodedVideoChunk;
+            meta?: EncodedVideoChunkMetadata;
+            dts: number;
+          }> = [];
+          const pendingAudioInitChunks: Array<{
+            chunk: EncodedAudioChunk;
+            meta?: EncodedAudioChunkMetadata;
+          }> = [];
+          let reorderResolved = !isMp4;
+          let reorderShiftUs = 0;
+          let lastEmittedVideoDtsUs = -1;
+
+          const flushResolvedInitialChunks = () => {
+            if (reorderResolved) return;
+            reorderResolved = true;
+            let minDiff = 0;
+            for (const item of pendingVideoInitChunks) {
+              const diff = item.chunk.timestamp - item.dts;
+              if (diff < minDiff) minDiff = diff;
+            }
+            reorderShiftUs = minDiff < 0 ? -minDiff : 0;
+
+            for (const item of pendingVideoInitChunks) {
+              const shiftedPts = item.chunk.timestamp + reorderShiftUs;
+              const safeDts =
+                lastEmittedVideoDtsUs >= 0
+                  ? Math.max(lastEmittedVideoDtsUs + 1, item.dts)
+                  : item.dts;
+              const safePts = Math.max(safeDts, shiftedPts);
+              const cts = Math.max(0, safePts - safeDts);
+              lastEmittedVideoDtsUs = safeDts;
+              mp4Muxer?.addVideoChunk(item.chunk, item.meta, safePts, cts);
+            }
+            pendingVideoInitChunks.length = 0;
+
+            for (const aItem of pendingAudioInitChunks) {
+              mp4Muxer?.addAudioChunk(
+                aItem.chunk,
+                aItem.meta,
+                aItem.chunk.timestamp + reorderShiftUs
+              );
+            }
+            pendingAudioInitChunks.length = 0;
+          };
+
+          videoEncoder = new VideoEncoder({
+            output: (chunk, meta) => {
+              if (!isMp4) {
+                webmMuxer?.addVideoChunk(chunk, meta);
+                return;
+              }
+              const dts = encodedVideoInputTsQueue.shift() ?? chunk.timestamp;
+              if (!reorderResolved) {
+                pendingVideoInitChunks.push({ chunk, meta, dts });
+                if (pendingVideoInitChunks.length >= 16) {
+                  flushResolvedInitialChunks();
+                }
+                return;
+              }
+              const shiftedPts = chunk.timestamp + reorderShiftUs;
+              const safeDts =
+                lastEmittedVideoDtsUs >= 0
+                  ? Math.max(lastEmittedVideoDtsUs + 1, dts)
+                  : dts;
+              const safePts = Math.max(safeDts, shiftedPts);
+              const cts = Math.max(0, safePts - safeDts);
+              lastEmittedVideoDtsUs = safeDts;
+              mp4Muxer?.addVideoChunk(chunk, meta, safePts, cts);
+            },
+            error: (e) => {
+              encodeError = e instanceof Error ? e : new Error(String(e));
+            },
+          });
+
+          audioEncoder = new AudioEncoder({
+            output: (chunk, meta) => {
+              if (!isMp4) {
+                webmMuxer?.addAudioChunk(chunk, meta);
+                return;
+              }
+              if (!reorderResolved) {
+                pendingAudioInitChunks.push({ chunk, meta });
+                return;
+              }
+              mp4Muxer?.addAudioChunk(chunk, meta, chunk.timestamp + reorderShiftUs);
+            },
+            error: (e) => {
+              encodeError = e instanceof Error ? e : new Error(String(e));
+            },
+          });
+
+          videoEncoder.configure({
+            codec: codecSupport.videoCodec,
+            width,
+            height,
+            bitrate: codecSupport.bitrate,
+            framerate: fps,
+            hardwareAcceleration: codecSupport.hardwareAcceleration,
+            ...(codecSupport.latencyMode
+              ? { latencyMode: codecSupport.latencyMode }
+              : {}),
+            ...(codecSupport.bitrateMode
+              ? { bitrateMode: codecSupport.bitrateMode }
+              : {}),
+          });
+
+          audioEncoder.configure({
+            codec: codecSupport.audioCodec,
+            numberOfChannels: 2,
+            sampleRate: 48000,
+            bitrate: codecSupport.audioBitrate,
+          });
+
+          let songL: Float32Array | null = songResampled.getChannelData(0);
+          let songR: Float32Array | null =
+            songResampled.numberOfChannels > 1 ? songResampled.getChannelData(1) : songL;
+          let mvL: Float32Array | null = offlineMv?.mvAudioBuffer
+            ? offlineMv.mvAudioBuffer.getChannelData(0)
+            : null;
+          let mvR: Float32Array | null = offlineMv?.mvAudioBuffer
+            ? offlineMv.mvAudioBuffer.numberOfChannels > 1
+              ? offlineMv.mvAudioBuffer.getChannelData(1)
+              : mvL
+            : null;
+
+          // Interleaved stereo audio accumulator (2048-sample chunks emitted in lockstep with video frames)
+          const AUDIO_CHUNK_SAMPLES = 2048;
+          const pendingAudioL = new Float32Array(AUDIO_CHUNK_SAMPLES);
+          const pendingAudioR = new Float32Array(AUDIO_CHUNK_SAMPLES);
+          let pendingAudioCount = 0;
+          let totalAudioSamplesEncoded = 0;
+
+          const flushAudioChunk = (force = false) => {
+            if (!audioEncoder || pendingAudioCount === 0) return;
+            if (!force && pendingAudioCount < AUDIO_CHUNK_SAMPLES) return;
+            const count = pendingAudioCount;
+            const planar = new Float32Array(count * 2);
+            planar.set(pendingAudioL.subarray(0, count), 0);
+            planar.set(pendingAudioR.subarray(0, count), count);
+            const audioData = new AudioData({
+              format: 'f32-planar',
+              sampleRate: 48000,
+              numberOfFrames: count,
+              numberOfChannels: 2,
+              timestamp: Math.round((totalAudioSamplesEncoded * 1_000_000) / 48000),
+              data: planar,
+            });
+            audioEncoder.encode(audioData);
+            audioData.close();
+            totalAudioSamplesEncoded += count;
+            pendingAudioCount = 0;
+          };
+
+          const pushMixedStereoSamples = (
+            phaseVal: MvTheaterPhase,
+            songStartSample: number,
+            mvStartSample: number,
+            songGainVal: number,
+            mvGainVal: number,
+            sampleCount: number
+          ) => {
+            const isSongActive =
+              phaseVal === 'normal' && songGainVal > 0.0001 && Boolean(songL && songR);
+            const isMvActive = Boolean(mvL && mvR) && mvGainVal > 0.0001;
+
+            for (let i = 0; i < sampleCount; i++) {
+              let l = 0;
+              let r = 0;
+              if (isSongActive && songL && songR) {
+                const si = songStartSample + i;
+                if (si >= 0 && si < songL.length) {
+                  l += songL[si] * songGainVal;
+                  r += songR[si] * songGainVal;
+                }
+              }
+              if (isMvActive && mvL && mvR) {
+                const mi = mvStartSample + i;
+                if (mi >= 0 && mi < mvL.length) {
+                  l += mvL[mi] * mvGainVal;
+                  r += mvR[mi] * mvGainVal;
+                }
+              }
+              pendingAudioL[pendingAudioCount] = l > 1 ? 1 : l < -1 ? -1 : l;
+              pendingAudioR[pendingAudioCount] = r > 1 ? 1 : r < -1 ? -1 : r;
+              pendingAudioCount++;
+              if (pendingAudioCount === AUDIO_CHUNK_SAMPLES) {
+                flushAudioChunk(true);
+              }
+            }
+          };
+
+          let phase: MvTheaterPhase = hasIntro ? 'intro' : 'normal';
+          let mvPhaseTime = 0;
+          let curAudioTime = hasIntro ? 0 : safeStart;
+          let activeMidBreak: MvMidBreakRange | null = null;
+          let outroStartMvSec = 0;
+
+          const initIdx = hasSynced
+            ? findActiveLyricIndex(
+                parsedLines,
+                curAudioTime,
+                options.track.lyricsOffsetMs || 0
+              )
+            : parsedLines.length > 0
+            ? 0
+            : -1;
+
+          const emptyAudioFrame: AudioAnalysisFrame = {
+            bass: 0,
+            mid: 0,
+            high: 0,
+            volume: 0,
+            frequencies: new Uint8Array(128),
+            waveform: new Uint8Array(128),
+          };
+
+          const drawState: StageDrawContextState = {
+            timeSec: curAudioTime,
+            audioTime: curAudioTime,
+            audioDuration: songDuration,
+            mvPhase: phase,
+            mvPhaseTime: 0,
+            uiOpacity: hasIntro ? 0 : 1,
+            isTheaterClarity: Boolean(mvVideoEl),
+            frame: songAnalyzer ? songAnalyzer.sampleAt(curAudioTime) : emptyAudioFrame,
+            smoothBass: 0,
+            smoothMid: 0,
+            smoothVol: 0,
+            activeIdx: initIdx,
+            prevIdx: initIdx,
+            lineTransitionElapsedSec: 1,
+            stepDirection: 'none',
+          };
+
+          const renderStartPerf = performance.now();
+          let lastYieldPerf = renderStartPerf;
+          let lastProgressPerf = -1000;
+          let actualRenderedSec = targetDuration;
+          const dt = 1 / fps;
+          const keyframeInterval = fps; // 1-second GOP for smooth scrubbing & zero decode stalls
+          const lyricsOffsetMs = options.track.lyricsOffsetMs || 0;
+          const containerLabel =
+            codecSupport.container === 'mp4'
+              ? `WebCodecs MP4 (高画质) · ${fps} fps`
+              : `WebCodecs WebM (高画质) · ${fps} fps`;
+
+          const sequentialMvReader = mvVideoEl
+            ? new SequentialMvVideoReader(mvVideoEl, mvDuration)
+            : null;
+
+          let songSampleCursor = Math.round(curAudioTime * 48000);
+          let mvSampleCursor = hasIntro
+            ? 0
+            : Math.round(
+                (computeSyncedMvTime(curAudioTime, timeline, completedBreaks) +
+                  (timeline.syncOffsetSec || 0)) *
+                  48000
+              );
+
+          for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
+            if (cancelled) {
+              throw new Error('已取消导出渲染');
+            }
+            if (encodeError) throw encodeError;
+
+            const relTime = frameIdx / fps;
+            if (finishEarlyRequested && frameIdx > fps * 2) {
+              actualRenderedSec = relTime;
+              break;
+            }
+
+            const curMvSeekTime = mvVideoEl
+              ? phase === 'normal'
+                ? computeSyncedMvTime(curAudioTime, timeline, completedBreaks) +
+                  (timeline.syncOffsetSec || 0)
+                : mvPhaseTime
+              : 0;
+
+            const visual = mvVideoEl
+              ? computeTheaterVisualState({
+                  phase,
+                  mvPhaseTime,
+                  timeline,
+                  activeMidBreak,
+                  audioTime: curAudioTime,
+                  audioDuration: songDuration,
+                  mvDurationSec: mvDuration,
+                  completedBreakIds: completedBreaks,
+                  fadeInSec: options.mvUiFadeInSec ?? timeline.fadeTransitionSec,
+                  fadeOutSec: options.mvUiFadeOutSec ?? timeline.fadeTransitionSec,
+                  outroStartMvSec,
+                  allowIntroTailCrossfade: true,
+                })
+              : {
+                  uiOpacity: 1,
+                  isTheaterClarity: false,
+                  skipLabel: null,
+                  skipSubLabel: null,
+                  songAudioGain: 1,
+                  mvAudioGain: 0,
+                };
+
+            // Sample exact frame-aligned audio spectrum & synthesize mixed PCM samples
+            const outSampleStart = Math.round((frameIdx * 48000) / fps);
+            const outSampleEnd = Math.round(((frameIdx + 1) * 48000) / fps);
+            const frameSampleCount = Math.max(0, outSampleEnd - outSampleStart);
+            pushMixedStereoSamples(
+              phase,
+              songSampleCursor,
+              mvSampleCursor,
+              visual.songAudioGain,
+              visual.mvAudioGain,
+              frameSampleCount
+            );
+            if (phase === 'normal') {
+              songSampleCursor += frameSampleCount;
+            }
+            mvSampleCursor += frameSampleCount;
+
+            // Sync MV video sequentially at adaptive encoder-matched speed (zero per-frame keyframe flushes)
+            if (sequentialMvReader) {
+              const elapsedSoFar = (performance.now() - renderStartPerf) / 1000;
+              const estRenderFps =
+                frameIdx >= 8 && elapsedSoFar > 0.08
+                  ? (frameIdx + 1) / elapsedSoFar
+                  : Math.max(fps, 90);
+              await sequentialMvReader.syncTo(
+                curMvSeekTime,
+                estRenderFps,
+                fps,
+                () => cancelled
+              );
+              if (cancelled) throw new Error('已取消导出渲染');
+            }
+
+            drawState.timeSec = relTime;
+            drawState.audioTime = curAudioTime;
+            drawState.mvPhase = phase;
+            drawState.mvPhaseTime = mvPhaseTime;
+            drawState.uiOpacity = visual.uiOpacity;
+            drawState.isTheaterClarity = visual.isTheaterClarity;
+            drawState.frame =
+              !mvVideoEl && songAnalyzer
+                ? songAnalyzer.sampleAt(curAudioTime)
+                : emptyAudioFrame;
+
+            advanceFlowState(
+              drawState,
+              parsedLines,
+              hasSynced,
+              lyricsOffsetMs,
+              dt
+            );
+
+            const isLastFrame = frameIdx === totalFrames - 1;
+            painter.drawFrame(
+              drawState,
+              mvVideoEl,
+              options.previewCanvas,
+              frameIdx === 0 || isLastFrame
+            );
+
+            const tsUs = Math.round((frameIdx * 1_000_000) / fps);
+            const nextTsUs = Math.round(((frameIdx + 1) * 1_000_000) / fps);
+            const durUs = Math.max(1, nextTsUs - tsUs);
+
+            const vf = new VideoFrame(painter.getCanvas(), {
+              timestamp: tsUs,
+              duration: durUs,
+            });
+            if (isMp4) {
+              encodedVideoInputTsQueue.push(tsUs);
+            }
+            videoEncoder.encode(vf, { keyFrame: frameIdx % keyframeInterval === 0 });
+            vf.close();
+
+            // Advance theater timeline state deterministically by 1 frame (dt)
+            let reachedEnd = false;
+            if (phase === 'intro' && mvVideoEl) {
+              mvPhaseTime += dt;
+              if (mvPhaseTime >= timeline.introEndSec - 1e-4) {
+                phase = 'normal';
+                curAudioTime = 0;
+                songSampleCursor = 0;
+              }
+            } else if (phase === 'mid-break' && activeMidBreak && mvVideoEl) {
+              mvPhaseTime += dt;
+              if (mvPhaseTime >= activeMidBreak.mvEndSec - 1e-4) {
+                completedBreaks.add(activeMidBreak.id);
+                curAudioTime = activeMidBreak.audioTriggerSec + 0.03;
+                songSampleCursor = Math.round(curAudioTime * 48000);
+                activeMidBreak = null;
+                phase = 'normal';
+              }
+            } else if (phase === 'outro' && mvVideoEl) {
+              mvPhaseTime += dt;
+              if (outroEnd > 0 && mvPhaseTime >= outroEnd - 1e-4) {
+                reachedEnd = true;
+              }
+            } else {
+              if (mvVideoEl) {
+                const triggered = findTriggeredMidBreak(
+                  curAudioTime,
+                  timeline,
+                  completedBreaks
+                );
+                if (triggered) {
+                  activeMidBreak = triggered;
+                  phase = 'mid-break';
+                  mvPhaseTime = triggered.mvStartSec;
+                  mvSampleCursor = Math.round(triggered.mvStartSec * 48000);
+                } else if (curAudioTime + dt >= songDuration - 0.02) {
+                  if (outroLen > 0.3) {
+                    phase = 'outro';
+                    outroStartMvSec = endSyncMv;
+                    mvPhaseTime = endSyncMv;
+                    mvSampleCursor = Math.round(endSyncMv * 48000);
+                  } else {
+                    reachedEnd = true;
+                  }
+                } else {
+                  curAudioTime += dt;
+                }
+              } else {
+                if (curAudioTime + dt >= songDuration - 0.01) {
+                  reachedEnd = true;
+                } else {
+                  curAudioTime += dt;
+                }
+              }
+            }
+
+            if (reachedEnd) {
+              actualRenderedSec = (frameIdx + 1) / fps;
+              break;
+            }
+
+            const nowPerf = performance.now();
+            const needsVideoBackpressure = videoEncoder.encodeQueueSize > 8;
+            const needsAudioBackpressure = audioEncoder.encodeQueueSize > 24;
+            const needsUiTick = nowPerf - lastYieldPerf >= 32 || frameIdx === 0;
+
+            if (needsVideoBackpressure || needsAudioBackpressure || needsUiTick || isLastFrame) {
+              if (nowPerf - lastProgressPerf >= 90 || frameIdx === 0 || isLastFrame) {
+                lastProgressPerf = nowPerf;
+                const elapsedWall = (nowPerf - renderStartPerf) / 1000;
+                const phaseLabel = mvVideoEl
+                  ? phase === 'intro'
+                    ? `正在逐帧无丢帧合成 MV 前瞻片段 (${fps} fps)...`
+                    : phase === 'mid-break'
+                    ? `正在逐帧无丢帧合成 MV 中段剧情 (${fps} fps)...`
+                    : phase === 'outro'
+                    ? `正在逐帧无丢帧合成 MV 后段尾声 (${fps} fps)...`
+                    : `正在逐帧高精度合成 MV + 网页舞台 (${fps} fps)...`
+                  : `正在以 ${fps} fps 高画质离线合成画面...`;
+
+                options.onProgress?.({
+                  percent: Math.min(98, ((frameIdx + 1) / totalFrames) * 96),
+                  elapsedSec: relTime,
+                  totalSec: targetDuration,
+                  phaseLabel,
+                  engineLabel: containerLabel,
+                  fps: elapsedWall > 0.1 ? Math.round((frameIdx + 1) / elapsedWall) : undefined,
+                });
+              }
+
+              if (needsVideoBackpressure || needsAudioBackpressure) {
+                while (
+                  (videoEncoder.encodeQueueSize > 4 || audioEncoder.encodeQueueSize > 16) &&
+                  !cancelled &&
+                  !encodeError
+                ) {
+                  await yieldImmediate();
+                }
+              } else {
+                await yieldImmediate();
+              }
+              lastYieldPerf = performance.now();
+            }
+          }
+
+          flushAudioChunk(true);
+
+          options.onProgress?.({
+            percent: 98,
+            elapsedSec: actualRenderedSec,
+            totalSec: targetDuration,
+            phaseLabel: '正在完成编解码并释放渲染内存...',
+            engineLabel: `${codecSupport.container.toUpperCase()} · ${fps} fps`,
+          });
+
+          await Promise.all([videoEncoder.flush(), audioEncoder.flush()]);
+          flushResolvedInitialChunks();
+          if (encodeError) throw encodeError;
+
+          // Release heavy codec instances, audio PCM arrays, and offscreen canvases before finalizing Blob
+          try {
+            if (videoEncoder.state !== 'closed') videoEncoder.close();
+          } catch {
+            // ignore
+          }
+          try {
+            if (audioEncoder.state !== 'closed') audioEncoder.close();
+          } catch {
+            // ignore
+          }
+          videoEncoder = null;
+          audioEncoder = null;
+          encodedVideoInputTsQueue.length = 0;
+          pendingVideoInitChunks.length = 0;
+          pendingAudioInitChunks.length = 0;
+          offlineMv?.dispose();
+          if (offlineMv) offlineMv.mvAudioBuffer = null;
+          offlineMv = null;
+          decodedSongBuffer = null;
+          songResampled = null;
+          songL = null;
+          songR = null;
+          mvL = null;
+          mvR = null;
+          songAnalyzer = null;
+          painter.dispose();
+
+          // Give browser GC a clean macrotask tick before finalizing container boxes
+          await new Promise<void>((r) => setTimeout(r, 20));
+
+          options.onProgress?.({
+            percent: 98.8,
+            elapsedSec: actualRenderedSec,
+            totalSec: targetDuration,
+            phaseLabel: '正在流式写入视频索引并生成最终文件...',
+            engineLabel: `${codecSupport.container.toUpperCase()} · ${fps} fps`,
+          });
+
+          if (mp4Muxer) {
+            mp4Muxer.finalize();
+            mp4Muxer = null;
+            const videoBlob = await sink.toBlob('video/mp4');
+            return {
+              videoBlob,
+              mimeType: 'video/mp4',
+              extension: 'mp4',
+              durationSec: actualRenderedSec,
+              width,
+              height,
+              fps,
+              engineUsed: 'webcodecs-mp4',
+            };
+          }
+
+          webmMuxer!.finalize();
+          webmMuxer = null;
+          const videoBlob = await sink.toBlob('video/webm');
+          return {
+            videoBlob,
+            mimeType: 'video/webm',
+            extension: 'webm',
+            durationSec: actualRenderedSec,
+            width,
+            height,
+            fps,
+            engineUsed: 'webcodecs-webm',
+          };
+        } finally {
+          try {
+            if (videoEncoder && videoEncoder.state !== 'closed') videoEncoder.close();
+          } catch {
+            // ignore
+          }
+          try {
+            if (audioEncoder && audioEncoder.state !== 'closed') audioEncoder.close();
+          } catch {
+            // ignore
+          }
+          offlineMv?.dispose();
+          painter.dispose();
+          sink.dispose();
+        }
+      }
+    }
+
+    // Path B Fallback: Only used if WebCodecs is unsupported or an external URL MV blocks canvas CORS
     const painter = new StageCanvasPainter({
       width,
       height,
@@ -1020,255 +2369,6 @@ export function startStageVideoRender(
     });
     const parsedLines = painter.getLines();
     const hasSynced = painter.getHasSynced();
-
-    // Path A: Ultra-fast offline WebCodecs render (exact 60..120fps deterministic timestamps!)
-    if (!hasUsableMv) {
-      const decodeCtx = new AudioContext();
-      let decodedBuffer: AudioBuffer;
-      try {
-        const arrBuf = await options.audioBlob.arrayBuffer();
-        decodedBuffer = await decodeCtx.decodeAudioData(arrBuf);
-      } finally {
-        await decodeCtx.close().catch(() => {});
-      }
-
-      const fullDuration = decodedBuffer.duration || options.track.duration || 10;
-      const safeStart = Math.min(Math.max(0, fullDuration - 1), requestedStartSec);
-      const remainingDur = Math.max(1, fullDuration - safeStart);
-      const targetDuration =
-        options.clipDurationSec && options.clipDurationSec > 1
-          ? Math.min(remainingDur, options.clipDurationSec)
-          : remainingDur;
-
-      const codecSupport = await probeWebCodecsSupport(width, height, 48000, fps);
-
-      if (codecSupport) {
-        const resampled = await resampleStereoAudioBuffer(decodedBuffer, 48000);
-        const analyzer = new OfflineAudioAnalyzer(resampled);
-        const totalFrames = Math.max(1, Math.ceil(targetDuration * fps));
-
-        let mp4Muxer: Mp4Muxer<Mp4ArrayBufferTarget> | null = null;
-        let webmMuxer: WebmMuxer<WebmArrayBufferTarget> | null = null;
-        let encodeError: Error | null = null;
-
-        if (codecSupport.container === 'mp4') {
-          mp4Muxer = new Mp4Muxer({
-            target: new Mp4ArrayBufferTarget(),
-            video: { codec: 'avc', width, height },
-            audio: { codec: 'aac', numberOfChannels: 2, sampleRate: 48000 },
-            fastStart: 'in-memory',
-            firstTimestampBehavior: 'offset',
-          });
-        } else {
-          webmMuxer = new WebmMuxer({
-            target: new WebmArrayBufferTarget(),
-            video: {
-              codec: codecSupport.videoCodec.startsWith('vp09') ? 'V_VP9' : 'V_VP8',
-              width,
-              height,
-              frameRate: fps,
-            },
-            audio: { codec: 'A_OPUS', numberOfChannels: 2, sampleRate: 48000 },
-            firstTimestampBehavior: 'offset',
-          });
-        }
-
-        const videoEncoder = new VideoEncoder({
-          output: (chunk, meta) => {
-            mp4Muxer?.addVideoChunk(chunk, meta);
-            webmMuxer?.addVideoChunk(chunk, meta);
-          },
-          error: (e) => {
-            encodeError = e instanceof Error ? e : new Error(String(e));
-          },
-        });
-
-        const audioEncoder = new AudioEncoder({
-          output: (chunk, meta) => {
-            mp4Muxer?.addAudioChunk(chunk, meta);
-            webmMuxer?.addAudioChunk(chunk, meta);
-          },
-          error: (e) => {
-            encodeError = e instanceof Error ? e : new Error(String(e));
-          },
-        });
-
-        videoEncoder.configure({
-          codec: codecSupport.videoCodec,
-          width,
-          height,
-          bitrate: codecSupport.bitrate,
-          framerate: fps,
-        });
-
-        audioEncoder.configure({
-          codec: codecSupport.audioCodec,
-          numberOfChannels: 2,
-          sampleRate: 48000,
-          bitrate: 192_000,
-        });
-
-        // Slice & encode stereo audio PCM chunks cleanly from [safeStart .. safeStart + targetDuration]
-        const leftCh = resampled.getChannelData(0);
-        const rightCh = resampled.numberOfChannels > 1 ? resampled.getChannelData(1) : leftCh;
-        const startSample = Math.min(leftCh.length, Math.floor(safeStart * 48000));
-        const maxSample = Math.min(
-          leftCh.length,
-          startSample + Math.ceil(targetDuration * 48000)
-        );
-        const audioChunkSize = 2048;
-
-        for (let offset = startSample; offset < maxSample; offset += audioChunkSize) {
-          if (cancelled || encodeError) break;
-          const count = Math.min(audioChunkSize, maxSample - offset);
-          const planar = new Float32Array(count * 2);
-          planar.set(leftCh.subarray(offset, offset + count), 0);
-          planar.set(rightCh.subarray(offset, offset + count), count);
-
-          const audioData = new AudioData({
-            format: 'f32-planar',
-            sampleRate: 48000,
-            numberOfFrames: count,
-            numberOfChannels: 2,
-            timestamp: Math.round(((offset - startSample) / 48000) * 1_000_000),
-            data: planar,
-          });
-          audioEncoder.encode(audioData);
-          audioData.close();
-
-          if (audioEncoder.encodeQueueSize > 24) {
-            await new Promise((r) => setTimeout(r, 4));
-          }
-        }
-
-        const initIdx = hasSynced
-          ? findActiveLyricIndex(parsedLines, safeStart, options.track.lyricsOffsetMs || 0)
-          : parsedLines.length > 0
-          ? 0
-          : -1;
-
-        const drawState: StageDrawContextState = {
-          timeSec: safeStart,
-          audioTime: safeStart,
-          audioDuration: fullDuration,
-          mvPhase: 'normal',
-          mvPhaseTime: 0,
-          uiOpacity: 1,
-          isTheaterClarity: false,
-          frame: analyzer.sampleAt(safeStart),
-          smoothBass: 0,
-          smoothMid: 0,
-          smoothVol: 0,
-          activeIdx: initIdx,
-          prevIdx: initIdx,
-          lineTransitionElapsedSec: 1,
-          stepDirection: 'none',
-        };
-
-        const renderStartPerf = performance.now();
-        let actualRenderedSec = targetDuration;
-        const dt = 1 / fps;
-
-        for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
-          if (cancelled) {
-            try {
-              videoEncoder.close();
-              audioEncoder.close();
-            } catch {
-              // ignore
-            }
-            throw new Error('已取消导出渲染');
-          }
-          if (encodeError) throw encodeError;
-
-          const relTime = frameIdx / fps;
-          const absAudioTime = safeStart + relTime;
-
-          if (finishEarlyRequested && frameIdx > fps * 2) {
-            actualRenderedSec = relTime;
-            break;
-          }
-
-          drawState.timeSec = absAudioTime;
-          drawState.audioTime = absAudioTime;
-          drawState.frame = analyzer.sampleAt(absAudioTime);
-          advanceFlowState(
-            drawState,
-            parsedLines,
-            hasSynced,
-            options.track.lyricsOffsetMs || 0,
-            dt
-          );
-
-          // Mirror to on-screen preview canvas every frame
-          painter.drawFrame(drawState, null, options.previewCanvas);
-
-          const vf = new VideoFrame(painter.getCanvas(), {
-            timestamp: Math.round(relTime * 1_000_000),
-            duration: Math.round(1_000_000 / fps),
-          });
-          videoEncoder.encode(vf, { keyFrame: frameIdx % (fps * 2) === 0 });
-          vf.close();
-
-          if (videoEncoder.encodeQueueSize > 8 || frameIdx % 8 === 0) {
-            const elapsedWall = (performance.now() - renderStartPerf) / 1000;
-            options.onProgress?.({
-              percent: Math.min(98, ((frameIdx + 1) / totalFrames) * 96),
-              elapsedSec: relTime,
-              totalSec: targetDuration,
-              phaseLabel: `正在以 ${fps} fps 极速离线合成网页全屏同款画面...`,
-              engineLabel:
-                codecSupport.container === 'mp4'
-                  ? `WebCodecs MP4 · ${fps} fps`
-                  : `WebCodecs WebM · ${fps} fps`,
-              fps: elapsedWall > 0.1 ? Math.round((frameIdx + 1) / elapsedWall) : undefined,
-            });
-            await new Promise((r) => setTimeout(r, 0));
-          }
-        }
-
-        options.onProgress?.({
-          percent: 98,
-          elapsedSec: actualRenderedSec,
-          totalSec: targetDuration,
-          phaseLabel: '正在封装高帧率音视频文件...',
-          engineLabel: `${codecSupport.container.toUpperCase()} · ${fps} fps`,
-        });
-
-        await Promise.all([videoEncoder.flush(), audioEncoder.flush()]);
-        videoEncoder.close();
-        audioEncoder.close();
-        if (encodeError) throw encodeError;
-
-        if (mp4Muxer) {
-          mp4Muxer.finalize();
-          const buf = mp4Muxer.target.buffer;
-          return {
-            videoBlob: new Blob([buf], { type: 'video/mp4' }),
-            mimeType: 'video/mp4',
-            extension: 'mp4',
-            durationSec: actualRenderedSec,
-            width,
-            height,
-            fps,
-            engineUsed: 'webcodecs-mp4',
-          };
-        }
-
-        webmMuxer!.finalize();
-        const buf = webmMuxer!.target.buffer;
-        return {
-          videoBlob: new Blob([buf], { type: 'video/webm' }),
-          mimeType: 'video/webm',
-          extension: 'webm',
-          durationSec: actualRenderedSec,
-          width,
-          height,
-          fps,
-          engineUsed: 'webcodecs-webm',
-        };
-      }
-    }
 
     // Path B: Synchronized Real-Time MV Theater + Audio Compositing via MediaRecorder
     const audioUrl = URL.createObjectURL(options.audioBlob);
@@ -1291,6 +2391,14 @@ export function startStageVideoRender(
       if (options.mvRecord?.sourceType === 'url') {
         videoEl.crossOrigin = 'anonymous';
       }
+      videoEl.style.position = 'fixed';
+      videoEl.style.left = '-9999px';
+      videoEl.style.top = '-9999px';
+      videoEl.style.width = '2px';
+      videoEl.style.height = '2px';
+      videoEl.style.opacity = '0.001';
+      videoEl.style.pointerEvents = 'none';
+      document.body.appendChild(videoEl);
       videoEl.src = mvUrl;
     }
 
@@ -1309,8 +2417,18 @@ export function startStageVideoRender(
     monitorGain.gain.value = isMonitorMuted ? 0 : 1;
     monitorGainRef = monitorGain;
 
-    const audioSource = isoCtx.createMediaElementSource(audioEl);
-    audioSource.connect(songGain);
+    let songAudioBuffer: AudioBuffer | null = null;
+    try {
+      const ab = await options.audioBlob.arrayBuffer();
+      songAudioBuffer = await isoCtx.decodeAudioData(ab);
+    } catch {
+      songAudioBuffer = null;
+    }
+
+    if (!songAudioBuffer) {
+      const audioSource = isoCtx.createMediaElementSource(audioEl);
+      audioSource.connect(songGain);
+    }
     songGain.connect(mixBus);
 
     let mvSourceAttached = false;
@@ -1330,8 +2448,29 @@ export function startStageVideoRender(
     mixBus.connect(monitorGain);
     monitorGain.connect(isoCtx.destination);
 
+    let activeSongSource: AudioBufferSourceNode | null = null;
+    let songPlayCtxStart = 0;
+    let songPlayOffsetSec = 0;
+    let songSourcePlaying = false;
+    let songEnded = false;
+
     const cleanup = () => {
       monitorGainRef = null;
+      if (activeSongSource) {
+        activeSongSource.onended = null;
+        try {
+          activeSongSource.stop();
+        } catch {
+          // ignore
+        }
+        try {
+          activeSongSource.disconnect();
+        } catch {
+          // ignore
+        }
+        activeSongSource = null;
+      }
+      songAudioBuffer = null;
       try {
         audioEl.pause();
         audioEl.removeAttribute('src');
@@ -1344,6 +2483,7 @@ export function startStageVideoRender(
           videoEl.pause();
           videoEl.removeAttribute('src');
           videoEl.load();
+          videoEl.remove();
         } catch {
           // ignore
         }
@@ -1357,13 +2497,15 @@ export function startStageVideoRender(
 
     try {
       await Promise.all([
-        new Promise<void>((resolve) => {
-          if (audioEl.readyState >= 1) return resolve();
-          const onReady = () => resolve();
-          audioEl.addEventListener('loadedmetadata', onReady, { once: true });
-          audioEl.addEventListener('error', onReady, { once: true });
-          setTimeout(resolve, 4000);
-        }),
+        songAudioBuffer
+          ? Promise.resolve()
+          : new Promise<void>((resolve) => {
+              if (audioEl.readyState >= 1) return resolve();
+              const onReady = () => resolve();
+              audioEl.addEventListener('loadedmetadata', onReady, { once: true });
+              audioEl.addEventListener('error', onReady, { once: true });
+              setTimeout(resolve, 4000);
+            }),
         videoEl
           ? new Promise<void>((resolve) => {
               if (videoEl!.readyState >= 1) return resolve();
@@ -1378,7 +2520,9 @@ export function startStageVideoRender(
       await isoCtx.resume().catch(() => {});
 
       const songDuration =
-        Number.isFinite(audioEl.duration) && audioEl.duration > 0
+        songAudioBuffer && songAudioBuffer.duration > 0
+          ? songAudioBuffer.duration
+          : Number.isFinite(audioEl.duration) && audioEl.duration > 0
           ? audioEl.duration
           : options.track.duration || 10;
       const timeline = options.mvRecord?.timeline || createDefaultMvTimeline();
@@ -1389,6 +2533,7 @@ export function startStageVideoRender(
           : options.mvRecord?.durationSec) || 0;
 
       const safeStart = Math.min(Math.max(0, songDuration - 1), requestedStartSec);
+      songPlayOffsetSec = safeStart;
       const hasIntro = Boolean(
         videoEl && safeStart <= 0.1 && timeline.introEnabled && timeline.introEndSec > 0.35
       );
@@ -1439,8 +2584,7 @@ export function startStageVideoRender(
       const chunks: Blob[] = [];
       const recorder = new MediaRecorder(combinedStream, {
         mimeType,
-        videoBitsPerSecond:
-          width >= 1920 ? (fps >= 90 ? 12_000_000 : 8_500_000) : fps >= 90 ? 8_000_000 : 5_500_000,
+        videoBitsPerSecond: getTargetBitrate(width, fps),
         audioBitsPerSecond: 192_000,
       });
       recorder.ondataavailable = (ev) => {
@@ -1482,32 +2626,113 @@ export function startStageVideoRender(
         stepDirection: 'none',
       };
 
+      const stopSongPlayback = () => {
+        if (songAudioBuffer) {
+          if (songSourcePlaying) {
+            songPlayOffsetSec = Math.min(
+              songDuration,
+              songPlayOffsetSec + Math.max(0, isoCtx.currentTime - songPlayCtxStart)
+            );
+            songSourcePlaying = false;
+          }
+          if (activeSongSource) {
+            activeSongSource.onended = null;
+            try {
+              activeSongSource.stop();
+            } catch {
+              // ignore
+            }
+            try {
+              activeSongSource.disconnect();
+            } catch {
+              // ignore
+            }
+            activeSongSource = null;
+          }
+        } else {
+          audioEl.pause();
+        }
+      };
+
+      const startSongPlaybackAt = (offsetSec: number) => {
+        const clamped = Math.max(0, Math.min(songDuration, offsetSec));
+        if (songAudioBuffer) {
+          stopSongPlayback();
+          songPlayOffsetSec = clamped;
+          if (clamped >= songDuration - 0.02) {
+            songEnded = true;
+            return;
+          }
+          songEnded = false;
+          const src = isoCtx.createBufferSource();
+          src.buffer = songAudioBuffer;
+          src.connect(songGain);
+          src.onended = () => {
+            if (activeSongSource === src) {
+              songSourcePlaying = false;
+              songPlayOffsetSec = songDuration;
+              songEnded = true;
+              activeSongSource = null;
+            }
+          };
+          if (isoCtx.state === 'suspended') {
+            isoCtx.resume().catch(() => {});
+          }
+          songPlayCtxStart = isoCtx.currentTime;
+          songSourcePlaying = true;
+          src.start(0, clamped);
+          activeSongSource = src;
+        } else {
+          songEnded = false;
+          audioEl.currentTime = clamped;
+          audioEl.play().catch(() => {});
+        }
+      };
+
+      const getCurSongTime = (): number => {
+        if (songAudioBuffer) {
+          if (songEnded) return songDuration;
+          if (!songSourcePlaying) return songPlayOffsetSec;
+          return Math.min(
+            songDuration,
+            songPlayOffsetSec + Math.max(0, isoCtx.currentTime - songPlayCtxStart)
+          );
+        }
+        return audioEl.currentTime || 0;
+      };
+
       if (hasIntro && videoEl) {
         songGain.gain.value = 0;
         mvGain.gain.value = 1;
         videoEl.currentTime = 0;
+        if (!songAudioBuffer) {
+          // Unlock fallback audioEl while songGain is 0 so later intro->normal play isn't blocked
+          await audioEl.play().catch(() => {});
+          audioEl.pause();
+          audioEl.currentTime = 0;
+        }
         await videoEl.play().catch(() => {});
       } else {
         songGain.gain.value = 1;
         mvGain.gain.value = 0;
-        audioEl.currentTime = safeStart;
         if (videoEl) {
           videoEl.currentTime =
             computeSyncedMvTime(safeStart, timeline, completedBreaks) +
             (timeline.syncOffsetSec || 0);
           await videoEl.play().catch(() => {});
         }
-        await audioEl.play().catch(() => {});
+        startSongPlaybackAt(safeStart);
       }
 
       recorder.start(250);
 
       let wallElapsed = 0;
       let lastTick = performance.now();
-      let songEnded = false;
-      audioEl.onended = () => {
-        songEnded = true;
-      };
+      if (!songAudioBuffer) {
+        audioEl.onended = () => {
+          songEnded = true;
+        };
+      }
 
       await new Promise<void>((resolve, reject) => {
         const frameIntervalMs = Math.max(8, Math.round(1000 / fps));
@@ -1516,6 +2741,7 @@ export function startStageVideoRender(
         const finishRecording = (wasCancelled: boolean) => {
           if (finished) return;
           finished = true;
+          stopSongPlayback();
           canvasStream.getTracks().forEach((t) => t.stop());
           if (wasCancelled) {
             try {
@@ -1545,7 +2771,7 @@ export function startStageVideoRender(
             return;
           }
 
-          const curAudioTime = audioEl.currentTime || 0;
+          let curAudioTime = getCurSongTime();
 
           if (phase === 'intro' && videoEl) {
             mvPhaseTime += dt;
@@ -1553,8 +2779,8 @@ export function startStageVideoRender(
             mvPhaseTime = probeTime;
             if (probeTime >= timeline.introEndSec - 0.04 || videoEl.ended) {
               phase = 'normal';
-              audioEl.currentTime = 0;
-              audioEl.play().catch(() => {});
+              startSongPlaybackAt(0);
+              curAudioTime = getCurSongTime();
             }
           } else if (phase === 'mid-break' && activeMidBreak && videoEl) {
             mvPhaseTime += dt;
@@ -1565,8 +2791,8 @@ export function startStageVideoRender(
               const resumeAt = activeMidBreak.audioTriggerSec + 0.03;
               activeMidBreak = null;
               phase = 'normal';
-              audioEl.currentTime = resumeAt;
-              audioEl.play().catch(() => {});
+              startSongPlaybackAt(resumeAt);
+              curAudioTime = getCurSongTime();
             }
           } else if (phase === 'outro' && videoEl) {
             mvPhaseTime += dt;
@@ -1590,7 +2816,7 @@ export function startStageVideoRender(
                 activeMidBreak = triggered;
                 phase = 'mid-break';
                 mvPhaseTime = triggered.mvStartSec;
-                audioEl.pause();
+                stopSongPlayback();
                 videoEl.currentTime = triggered.mvStartSec;
                 videoEl.play().catch(() => {});
               } else if (songEnded || curAudioTime >= songDuration - 0.05) {
@@ -1598,7 +2824,7 @@ export function startStageVideoRender(
                   phase = 'outro';
                   outroStartMvSec = endSyncMv;
                   mvPhaseTime = endSyncMv;
-                  audioEl.pause();
+                  stopSongPlayback();
                   videoEl.currentTime = endSyncMv;
                   videoEl.play().catch(() => {});
                 } else {
@@ -1733,6 +2959,7 @@ export function startStageVideoRender(
       await recorderStopped;
 
       const videoBlob = new Blob(chunks, { type: mimeType });
+      chunks.length = 0;
       return {
         videoBlob,
         mimeType,
@@ -1745,6 +2972,7 @@ export function startStageVideoRender(
       };
     } finally {
       cleanup();
+      painter.dispose();
     }
   })();
 

@@ -328,6 +328,11 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
   const outroStartMvSecRef = useRef<number>(0);
   const allowIntroTailCrossfadeRef = useRef<boolean>(true);
   const lastLiveSnapAtRef = useRef<number>(0);
+  const mvSyncSeqRef = useRef<number>(0);
+  const normalEnteredAtPerfRef = useRef<number>(0);
+  const theaterTransitionInFlightRef = useRef<boolean>(false);
+  const pendingAutoplayUnlockRef = useRef<boolean>(false);
+  const lastWatchdogPlayAtRef = useRef<number>(0);
   const shufflePlayedIdsRef = useRef<Set<string>>(new Set());
   const shuffleHistoryRef = useRef<string[]>([]);
 
@@ -410,6 +415,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
 
   const syncTrackMvsForTrack = useCallback(
     async (trackId: string | null): Promise<TrackMvRecord | null> => {
+      const seq = ++mvSyncSeqRef.current;
       if (!trackId) {
         if (mvObjectUrlRef.current) {
           URL.revokeObjectURL(mvObjectUrlRef.current);
@@ -422,6 +428,11 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       }
 
       const records = await getTrackMvs(trackId);
+      const chosen = records.find((r) => r.isActive) || records[0] || null;
+      if (mvSyncSeqRef.current !== seq) {
+        return chosen;
+      }
+
       const metas: TrackMvMeta[] = records.map(({ videoBlob: _b, ...meta }) => meta);
       setTrackMvs(metas);
       setAllMvCountByTrack((prev) => ({
@@ -429,7 +440,6 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
         [trackId]: metas.length,
       }));
 
-      const chosen = records.find((r) => r.isActive) || records[0] || null;
       setActiveMv(chosen);
 
       if (mvObjectUrlRef.current) {
@@ -524,6 +534,11 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       const target = stateRef.current.tracks.find((t) => t.id === id);
       if (!target) return;
 
+      // Unlock AudioContext + HTMLAudioElement synchronously inside user gesture BEFORE async IndexedDB reads
+      audioEngine.unlockInUserGesture();
+      pendingAutoplayUnlockRef.current = false;
+      theaterTransitionInFlightRef.current = false;
+
       setCurrentTrackId(id); // Immediate UI & album cover popup update
 
       if (customQueue) {
@@ -588,6 +603,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       }
 
       allowIntroTailCrossfadeRef.current = false;
+      normalEnteredAtPerfRef.current = performance.now();
       audioEngine.setTheaterMixGains(1, 0, 0.008);
       setMvPhase('normal');
       mvPhaseTimeRef.current = 0;
@@ -744,8 +760,11 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
   }, [playTrackById]);
 
   const togglePlayPause = useCallback(async () => {
+    pendingAutoplayUnlockRef.current = false;
+
     const el = audioEngine.element;
     if (!currentTrack && tracks.length > 0) {
+      audioEngine.unlockInUserGesture();
       await playTrackById(tracks[0].id, tracks.map((t) => t.id));
       return;
     }
@@ -756,13 +775,22 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
 
     // During intro / mid-break / outro, transport toggles MV theater clock cleanly
     if (mvPhaseRef.current !== 'normal') {
-      setIsPlaying((prev) => !prev);
+      const nextPlaying = !isPlayingRef.current;
+      if (nextPlaying) {
+        audioEngine.resumeContext().catch(() => {});
+        if (!el.src) {
+          audioEngine.unlockInUserGesture();
+        }
+      }
+      setIsPlaying(nextPlaying);
       return;
     }
 
+    const wantsPlay = !isPlayingRef.current;
+
     // Starting fresh at 0:00 when intro is enabled & not yet completed
     if (
-      el.paused &&
+      wantsPlay &&
       (el.currentTime || 0) < 0.25 &&
       !introDoneForPlayRef.current &&
       mvPrefsRef.current.mvBackgroundEnabled &&
@@ -771,6 +799,10 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     ) {
       audioEngine.resumeContext().catch(() => {});
       audioEngine.setTheaterMixGains(0, 1, 0.005);
+      if (loadedTrackIdRef.current !== currentTrack.id || !el.src) {
+        audioEngine.unlockInUserGesture();
+        await loadBlobIntoEngine(currentTrack, false, { suppressAutoplay: true });
+      }
       allowIntroTailCrossfadeRef.current = true;
       audioEngine.primeForDelayedPlayback().catch(() => {});
       mvPhaseTimeRef.current = 0;
@@ -780,11 +812,15 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       return;
     }
 
-    if (el.paused) {
+    if (wantsPlay) {
+      normalEnteredAtPerfRef.current = performance.now();
+      audioEngine.resumeContext().catch(() => {});
       if (loadedTrackIdRef.current !== currentTrack.id || !el.src) {
+        audioEngine.unlockInUserGesture();
         await loadBlobIntoEngine(currentTrack, true);
       } else {
         try {
+          setIsPlaying(true);
           await audioEngine.play();
         } catch (err) {
           console.warn('Playback toggle failed:', err);
@@ -793,6 +829,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       }
     } else {
       audioEngine.pause();
+      setIsPlaying(false);
     }
   }, [currentTrack, tracks, playTrackById, loadBlobIntoEngine, showToast]);
 
@@ -977,16 +1014,91 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     navigator.mediaSession.setActionHandler('nexttrack', () => playNext(true));
   }, [currentTrack, togglePlayPause, playPrev, playNext]);
 
-  // MV Theater Timeline RAF Clock & Mid-Break Trigger Loop
+  // Helper to hand off audio seamlessly from MV Intro / Mid-Break back to song track
+  const resumeSongAudioAfterTheaterPhase = useCallback(
+    async (resumeSec: number) => {
+      if (theaterTransitionInFlightRef.current) return;
+      theaterTransitionInFlightRef.current = true;
+      normalEnteredAtPerfRef.current = performance.now();
+
+      try {
+        const curTrack =
+          stateRef.current.tracks.find((t) => t.id === stateRef.current.currentTrackId) ||
+          null;
+        if (!curTrack) return;
+
+        if (loadedTrackIdRef.current !== curTrack.id || !audioEngine.element.src) {
+          await loadBlobIntoEngine(curTrack, false, { suppressAutoplay: true });
+        }
+
+        if (mvPhaseRef.current !== 'normal' || !isPlayingRef.current) {
+          return;
+        }
+
+        audioEngine.seek(resumeSec);
+        setCurrentTime(resumeSec);
+        await audioEngine.play();
+
+        // Double-check element actually entered playing state
+        if (audioEngine.element.paused && mvPhaseRef.current === 'normal' && isPlayingRef.current) {
+          await new Promise<void>((r) => window.setTimeout(r, 40));
+          if (audioEngine.element.paused && mvPhaseRef.current === 'normal' && isPlayingRef.current) {
+            await audioEngine.play();
+          }
+        }
+        pendingAutoplayUnlockRef.current = false;
+      } catch (err) {
+        console.warn('Transition from MV theater to song audio failed:', err);
+        if (mvPhaseRef.current === 'normal') {
+          pendingAutoplayUnlockRef.current = true;
+          setIsPlaying(false);
+          showToast('前瞻已结束，轻触屏幕任意位置即可恢复播放歌曲');
+        }
+      } finally {
+        theaterTransitionInFlightRef.current = false;
+      }
+    },
+    [loadBlobIntoEngine, showToast]
+  );
+
+  // One-tap recovery if mobile browser blocked delayed transition audio
+  useEffect(() => {
+    const onRecoverGesture = () => {
+      if (!pendingAutoplayUnlockRef.current) return;
+      pendingAutoplayUnlockRef.current = false;
+      audioEngine.unlockInUserGesture();
+      if (mvPhaseRef.current === 'normal' && audioEngine.element.paused) {
+        normalEnteredAtPerfRef.current = performance.now();
+        audioEngine
+          .play()
+          .then(() => {
+            setIsPlaying(true);
+          })
+          .catch(() => {});
+      }
+    };
+    window.addEventListener('pointerdown', onRecoverGesture, { passive: true });
+    window.addEventListener('keydown', onRecoverGesture, { passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', onRecoverGesture);
+      window.removeEventListener('keydown', onRecoverGesture);
+    };
+  }, []);
+
+  // MV Theater Timeline Clock & Mid-Break Trigger Loop (RAF + Background Tab Interval Fallback)
   useEffect(() => {
     if (!isPlaying) return;
     let rafId = 0;
+    let bgTimerId = 0;
     let lastStamp = performance.now();
     let lastUiSync = 0;
     let lastCrossfadeUiSync = 0;
 
-    const tick = (now: number) => {
-      const dt = Math.min(0.25, Math.max(0, (now - lastStamp) / 1000));
+    const stepClock = (now: number) => {
+      if (!isPlayingRef.current) return;
+      const maxDt = document.hidden ? 2.5 : 0.25;
+      const dt = Math.min(maxDt, Math.max(0, (now - lastStamp) / 1000));
+      if (dt < 0.002) return;
       lastStamp = now;
 
       const phase = mvPhaseRef.current;
@@ -997,22 +1109,20 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
         const nextMvT = mvPhaseTimeRef.current + dt;
         mvPhaseTimeRef.current = nextMvT;
         const endSec = mv.timeline.introEndSec || 0;
-        const videoEl = document.querySelector('video') as HTMLVideoElement | null;
-        const actualVideoT = videoEl && Number.isFinite(videoEl.currentTime) ? videoEl.currentTime : nextMvT;
-        
+        const videoEl = document.querySelector(
+          'video[data-lumina-mv-stage="true"]'
+        ) as HTMLVideoElement | null;
+        const actualVideoT =
+          videoEl && Number.isFinite(videoEl.currentTime) ? videoEl.currentTime : nextMvT;
+
         if (nextMvT >= endSec || (videoEl && actualVideoT >= endSec - 0.05)) {
           introDoneForPlayRef.current = true;
           allowIntroTailCrossfadeRef.current = true;
           mvPhaseRef.current = 'normal';
+          normalEnteredAtPerfRef.current = now;
           setMvPhase('normal');
           setMvPhaseTime(endSec);
-          audioEngine.seek(0);
-          setCurrentTime(0);
-          audioEngine.play().catch((err) => {
-            if (err instanceof DOMException && err.name === 'AbortError') return;
-            console.warn('Transition from MV intro to song audio failed:', err);
-            setIsPlaying(false);
-          });
+          void resumeSongAudioAfterTheaterPhase(0);
           phaseTransitioned = true;
         } else if (now - lastUiSync >= 66) {
           lastUiSync = now;
@@ -1026,16 +1136,11 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
           completedBreakIdsRef.current.add(brk.id);
           mvPhaseRef.current = 'normal';
           activeMidBreakRef.current = null;
+          normalEnteredAtPerfRef.current = now;
           setMvPhase('normal');
           setActiveMidBreak(null);
           setMvPhaseTime(brk.mvEndSec);
-          audioEngine.seek(brk.audioTriggerSec + 0.02);
-          setCurrentTime(brk.audioTriggerSec + 0.02);
-          audioEngine.play().catch((err) => {
-            if (err instanceof DOMException && err.name === 'AbortError') return;
-            console.warn('Transition from MV mid-break to song audio failed:', err);
-            setIsPlaying(false);
-          });
+          void resumeSongAudioAfterTheaterPhase(brk.audioTriggerSec + 0.02);
           phaseTransitioned = true;
         } else if (now - lastUiSync >= 66) {
           lastUiSync = now;
@@ -1055,25 +1160,40 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
           lastUiSync = now;
           setMvPhaseTime(nextMvT);
         }
-      } else if (phase === 'normal' && mv && mvPrefsRef.current.mvBackgroundEnabled) {
-        const audioT = audioEngine.element.currentTime || 0;
-        const brk = findTriggeredMidBreak(
-          audioT,
-          mv.timeline,
-          completedBreakIdsRef.current
-        );
-        if (brk) {
-          audioEngine.pause();
-          audioEngine.seek(brk.audioTriggerSec);
-          setCurrentTime(brk.audioTriggerSec);
-          mvPhaseRef.current = 'mid-break';
-          activeMidBreakRef.current = brk;
-          mvPhaseTimeRef.current = brk.mvStartSec;
-          setMvPhase('mid-break');
-          setActiveMidBreak(brk);
-          setMvPhaseTime(brk.mvStartSec);
-          setIsPlaying(true);
-          phaseTransitioned = true;
+      } else if (phase === 'normal') {
+        // Watchdog: if in normal phase & isPlaying yet audioEl failed/stalled paused, retry once smoothly
+        if (
+          audioEngine.element.paused &&
+          !audioEngine.isPriming &&
+          !audioEngine.element.ended &&
+          !theaterTransitionInFlightRef.current &&
+          now - normalEnteredAtPerfRef.current > 350 &&
+          now - lastWatchdogPlayAtRef.current > 1200
+        ) {
+          lastWatchdogPlayAtRef.current = now;
+          void resumeSongAudioAfterTheaterPhase(audioEngine.element.currentTime || 0);
+        }
+
+        if (mv && mvPrefsRef.current.mvBackgroundEnabled) {
+          const audioT = audioEngine.element.currentTime || 0;
+          const brk = findTriggeredMidBreak(
+            audioT,
+            mv.timeline,
+            completedBreakIdsRef.current
+          );
+          if (brk) {
+            audioEngine.pause();
+            audioEngine.seek(brk.audioTriggerSec);
+            setCurrentTime(brk.audioTriggerSec);
+            mvPhaseRef.current = 'mid-break';
+            activeMidBreakRef.current = brk;
+            mvPhaseTimeRef.current = brk.mvStartSec;
+            setMvPhase('mid-break');
+            setActiveMidBreak(brk);
+            setMvPhaseTime(brk.mvStartSec);
+            setIsPlaying(true);
+            phaseTransitioned = true;
+          }
         }
       }
 
@@ -1084,12 +1204,22 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
             ? audioEngine.element.duration
             : 0;
         const liveAudioT = audioEngine.element.currentTime || 0;
+        const normalElapsedSec = Math.max(0, (now - normalEnteredAtPerfRef.current) / 1000);
+        // Prevent songMixGain=0 deadlock during initial startup decode frames at audioTime=0
+        const effectiveAudioTForMix =
+          mvPhaseRef.current === 'normal' &&
+          allowIntroTailCrossfadeRef.current &&
+          !audioEngine.element.paused &&
+          liveAudioT < 0.6
+            ? Math.max(liveAudioT, normalElapsedSec)
+            : liveAudioT;
+
         const vis = computeTheaterVisualState({
           phase: mvPhaseRef.current,
           mvPhaseTime: mvPhaseTimeRef.current,
           timeline: mv.timeline,
           activeMidBreak: activeMidBreakRef.current,
-          audioTime: liveAudioT,
+          audioTime: effectiveAudioTForMix,
           audioDuration: elDur,
           mvDurationSec: mv.durationSec,
           completedBreakIds: completedBreakIdsRef.current,
@@ -1115,17 +1245,33 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       } else {
         audioEngine.setTheaterMixGains(1, 0, 0.018);
       }
+    };
 
+    const tick = (now: number) => {
+      stepClock(now);
       rafId = requestAnimationFrame(tick);
     };
 
     rafId = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(rafId);
-  }, [isPlaying, playNext]);
+    // Keep intro/mid-break/outro transitions firing on time even if main tab is backgrounded (e.g. standalone MV window)
+    bgTimerId = window.setInterval(() => {
+      const now = performance.now();
+      if (now - lastStamp >= 110) {
+        stepClock(now);
+      }
+    }, 140);
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      window.clearInterval(bgTimerId);
+    };
+  }, [isPlaying, playNext, resumeSongAudioAfterTheaterPhase]);
 
   const seekTo = useCallback((timeSec: number) => {
+    audioEngine.resumeContext().catch(() => {});
     const mv = activeMvRef.current;
     allowIntroTailCrossfadeRef.current = false;
+    normalEnteredAtPerfRef.current = performance.now();
     if (mvPhaseRef.current !== 'normal') {
       mvPhaseRef.current = 'normal';
       setMvPhase('normal');
@@ -1143,14 +1289,16 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     audioEngine.setTheaterMixGains(1, 0, 0.012);
   }, []);
 
-  const seekMvTimeline = useCallback((mvTimeSec: number) => {
-    const mv = activeMvRef.current;
-    const targetMvT = Math.max(0, Number.isFinite(mvTimeSec) ? mvTimeSec : 0);
-    if (!mv) {
-      audioEngine.seek(targetMvT);
-      setCurrentTime(targetMvT);
-      return;
-    }
+  const seekMvTimeline = useCallback(
+    (mvTimeSec: number) => {
+      audioEngine.resumeContext().catch(() => {});
+      const mv = activeMvRef.current;
+      const targetMvT = Math.max(0, Number.isFinite(mvTimeSec) ? mvTimeSec : 0);
+      if (!mv) {
+        audioEngine.seek(targetMvT);
+        setCurrentTime(targetMvT);
+        return;
+      }
 
     const tl = mv.timeline;
     const audioDur =
@@ -1240,18 +1388,21 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
 
     completedBreakIdsRef.current = completedSet;
     introDoneForPlayRef.current = true;
+    allowIntroTailCrossfadeRef.current = false;
     mvPhaseRef.current = 'normal';
     activeMidBreakRef.current = null;
+    normalEnteredAtPerfRef.current = performance.now();
     mvPhaseTimeRef.current = targetMvT;
     setMvPhase('normal');
     setActiveMidBreak(null);
     setMvPhaseTime(targetMvT);
     audioEngine.seek(clampedAudioT);
     setCurrentTime(clampedAudioT);
+    audioEngine.setTheaterMixGains(1, 0, 0.012);
     if (isPlayingRef.current && audioEngine.element.paused) {
-      audioEngine.play().catch(() => {});
+      void resumeSongAudioAfterTheaterPhase(clampedAudioT);
     }
-  }, []);
+  }, [resumeSongAudioAfterTheaterPhase]);
 
   const setVolume = useCallback(
     (vol: number) => {
@@ -1713,6 +1864,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
 
   const playPlaylist = useCallback(
     async (playlistId: string, startTrackId?: string) => {
+      audioEngine.unlockInUserGesture();
       const pl = playlists.find((p) => p.id === playlistId);
       if (!pl || pl.trackIds.length === 0) {
         showToast('该播放列表暂无歌曲');
@@ -2388,6 +2540,8 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
   );
 
   const skipMvPhase = useCallback(async () => {
+    audioEngine.unlockInUserGesture();
+    pendingAutoplayUnlockRef.current = false;
     const phase = mvPhaseRef.current;
     const mv = activeMvRef.current;
 
@@ -2395,6 +2549,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       introDoneForPlayRef.current = true;
       allowIntroTailCrossfadeRef.current = false;
       mvPhaseRef.current = 'normal';
+      normalEnteredAtPerfRef.current = performance.now();
       setMvPhase('normal');
       const endSec = mv?.timeline.introEndSec || 0;
       mvPhaseTimeRef.current = endSec;
@@ -2407,6 +2562,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
           await loadBlobIntoEngine(currentTrack, true);
         } else {
           await audioEngine.play().catch(() => {});
+          setIsPlaying(true);
         }
       }
       showToast('已跳过前瞻，进入主歌对齐播放');
@@ -2418,6 +2574,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       completedBreakIdsRef.current.add(brk.id);
       mvPhaseRef.current = 'normal';
       activeMidBreakRef.current = null;
+      normalEnteredAtPerfRef.current = performance.now();
       setMvPhase('normal');
       setActiveMidBreak(null);
       mvPhaseTimeRef.current = brk.mvEndSec;
@@ -2426,6 +2583,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       setCurrentTime(brk.audioTriggerSec + 0.04);
       audioEngine.setTheaterMixGains(1, 0, 0.02);
       await audioEngine.play().catch(() => {});
+      setIsPlaying(true);
       showToast('已跳过中段，恢复音乐播放');
       return;
     }
@@ -2438,6 +2596,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
   }, [currentTrack, loadBlobIntoEngine, playNext, showToast]);
 
   const restartTrackWithMvIntro = useCallback(async () => {
+    audioEngine.unlockInUserGesture();
     if (!currentTrack) return;
     await playTrackById(currentTrack.id);
   }, [currentTrack, playTrackById]);
@@ -2482,8 +2641,12 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     personalization.mvUiFadeOutSec,
   ]);
 
-  // Keep AudioEngine mix gains in sync even when paused or right after phase transitions
+  // Keep AudioEngine mix gains in sync when paused or outside normal playback;
+  // during active normal playback, stepClock drives 60fps crossfade gains.
   useEffect(() => {
+    if (isPlayingRef.current && mvPhaseRef.current === 'normal') {
+      return;
+    }
     audioEngine.setTheaterMixGains(
       mvTheaterVisual.songAudioGain,
       mvTheaterVisual.mvAudioGain,

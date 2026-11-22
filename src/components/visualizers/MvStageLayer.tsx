@@ -223,6 +223,7 @@ export const MvStageLayer: React.FC<MvStageLayerProps> = React.memo(({
       <video
         ref={videoRef}
         src={src}
+        data-lumina-mv-stage={dspEngine === audioEngine ? 'true' : undefined}
         playsInline
         preload="auto"
         onLoadedMetadata={() => {

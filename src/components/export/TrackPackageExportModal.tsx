@@ -149,7 +149,7 @@ export const TrackPackageExportModal: React.FC<TrackPackageExportModalProps> = (
   const safeTitle = sanitizeFileName(track.title, 'track');
 
   const totalTrackDuration = Math.max(3, Math.round(track.duration || 30));
-  const clampedFps = Math.max(60, Math.min(120, Math.round(targetFps || 60)));
+  const clampedFps = Math.max(30, Math.min(120, Math.round(targetFps || 60)));
   const clampedStartSec = Math.max(
     0,
     Math.min(Math.max(0, totalTrackDuration - 3), Math.round(customStartSec || 0))
@@ -199,8 +199,11 @@ export const TrackPackageExportModal: React.FC<TrackPackageExportModalProps> = (
       percent: 1,
       elapsedSec: 0,
       totalSec: effectiveDurationSec,
-      phaseLabel: `正在初始化 ${clampedFps} fps 渲染引擎与音频频谱...`,
-      engineLabel: includeMvInVideo && mvRecord ? `MV 联动 · ${clampedFps} fps` : `WebCodecs · ${clampedFps} fps`,
+      phaseLabel: `正在初始化 ${clampedFps} fps 高画质渲染引擎与音频轨道...`,
+      engineLabel:
+        includeMvInVideo && mvRecord
+          ? `WebCodecs MV 高画质合成 · ${clampedFps} fps`
+          : `WebCodecs · ${clampedFps} fps`,
     });
 
     const ctrl = startStageVideoRender({
@@ -336,7 +339,15 @@ export const TrackPackageExportModal: React.FC<TrackPackageExportModalProps> = (
         setStatus('done');
         showToast(`已将 ${saved.fileCount} 个文件保存至本地文件夹「${saved.folderName}」`);
       } else {
-        const zipBlob = await buildZipBlob(entries);
+        await new Promise<void>((r) => setTimeout(r, 25));
+        const zipBlob = await buildZipBlob(entries, (p01) => {
+          const pct = Math.round(p01 * 100);
+          setProgress((prev) => ({
+            ...prev,
+            percent: 99 + p01 * 0.9,
+            phaseLabel: `正在流式校验并打包「${folderName}.zip」(${pct}%)...`,
+          }));
+        });
         setPackagedZipBlob(zipBlob);
         triggerBlobDownload(zipBlob, `${folderName}.zip`);
         setStatus('done');
@@ -449,7 +460,7 @@ export const TrackPackageExportModal: React.FC<TrackPackageExportModalProps> = (
                         无需外部录屏，直接将全屏网页舞台合成为高帧率视频并打包歌曲文件夹
                       </p>
                       <p className="text-xs text-white/60 leading-relaxed">
-                        画面与当前全屏网页一致：左侧固定圆角方形专辑图与作曲家/歌手信息，右侧无边框三行流动歌词（使用当前网页字体）{mvRecord ? '，以及已关联 MV 的剧情联动' : ''}。
+                        画面采用干净舞台构图：左侧固定圆角方形专辑图、歌名歌手与进度条（无上下曲/暂停键），右侧无边框三行流动歌词（使用当前网页字体）{mvRecord ? '，以及已关联 MV 的剧情联动' : ''}。
                       </p>
                     </div>
                   </div>
@@ -569,62 +580,79 @@ export const TrackPackageExportModal: React.FC<TrackPackageExportModalProps> = (
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div className="space-y-1.5">
-                    <p className="text-xs font-medium text-white/70">导出清晰度</p>
-                    <div className="flex gap-1.5">
-                      {(['720p', '1080p'] as StageVideoQuality[]).map((q) => (
-                        <button
-                          key={q}
-                          type="button"
-                          onClick={() => setQuality(q)}
-                          className={`flex-1 py-1.5 rounded-xl text-xs font-medium cursor-pointer border transition-colors ${
-                            quality === q
-                              ? 'bg-white/16 border-white/25 text-white'
-                              : 'bg-white/[0.04] border-white/10 text-white/60 hover:text-white'
-                          }`}
-                        >
-                          {q === '720p' ? '720P 极速' : '1080P 超清'}
-                        </button>
-                      ))}
-                    </div>
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs font-medium text-white/70">导出清晰度 (720P – 2160P)</p>
+                    <span className="text-[11px] font-mono-tabular text-white/50">
+                      {quality === '2160p'
+                        ? '3840×2160'
+                        : quality === '1440p'
+                        ? '2560×1440'
+                        : quality === '1080p'
+                        ? '1920×1080'
+                        : '1280×720'}
+                    </span>
                   </div>
-
-                  <div className="space-y-1.5">
-                    <p className="text-xs font-medium text-white/70">导出时长</p>
-                    <div className="flex gap-1.5">
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                    {(
+                      [
+                        { id: '720p', label: '720P', tag: '极速' },
+                        { id: '1080p', label: '1080P', tag: '高清' },
+                        { id: '1440p', label: '1440P', tag: '2K' },
+                        { id: '2160p', label: '2160P', tag: '4K' },
+                      ] as { id: StageVideoQuality; label: string; tag: string }[]
+                    ).map((q) => (
                       <button
+                        key={q.id}
                         type="button"
-                        onClick={() => setDurationMode('full')}
-                        className={`flex-1 py-1.5 rounded-xl text-xs font-medium cursor-pointer border transition-colors ${
-                          durationMode === 'full'
+                        onClick={() => setQuality(q.id)}
+                        className={`py-1.5 px-2 rounded-xl text-xs font-medium cursor-pointer border transition-colors flex items-center justify-center gap-1 whitespace-nowrap ${
+                          quality === q.id
                             ? 'bg-white/16 border-white/25 text-white'
                             : 'bg-white/[0.04] border-white/10 text-white/60 hover:text-white'
                         }`}
                       >
-                        完整全曲
+                        <span className="font-mono-tabular">{q.label}</span>
+                        <span className="text-[10px] text-white/55">{q.tag}</span>
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => setDurationMode('custom')}
-                        className={`flex-1 py-1.5 rounded-xl text-xs font-medium cursor-pointer border transition-colors ${
-                          durationMode === 'custom'
-                            ? 'bg-white/16 border-white/25 text-white'
-                            : 'bg-white/[0.04] border-white/10 text-white/60 hover:text-white'
-                        }`}
-                      >
-                        自定义时长
-                      </button>
-                    </div>
+                    ))}
                   </div>
                 </div>
 
-                {/* Custom FPS Selector (60 - 120 fps) */}
+                <div className="space-y-1.5">
+                  <p className="text-xs font-medium text-white/70">导出时长</p>
+                  <div className="flex gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setDurationMode('full')}
+                      className={`flex-1 py-1.5 rounded-xl text-xs font-medium cursor-pointer border transition-colors ${
+                        durationMode === 'full'
+                          ? 'bg-white/16 border-white/25 text-white'
+                          : 'bg-white/[0.04] border-white/10 text-white/60 hover:text-white'
+                      }`}
+                    >
+                      完整全曲
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDurationMode('custom')}
+                      className={`flex-1 py-1.5 rounded-xl text-xs font-medium cursor-pointer border transition-colors ${
+                        durationMode === 'custom'
+                          ? 'bg-white/16 border-white/25 text-white'
+                          : 'bg-white/[0.04] border-white/10 text-white/60 hover:text-white'
+                      }`}
+                    >
+                      自定义时长
+                    </button>
+                  </div>
+                </div>
+
+                {/* Custom FPS Selector (30 - 120 fps) */}
                 <div className="space-y-2 pt-0.5">
                   <div className="flex items-center justify-between gap-2">
-                    <p className="text-xs font-medium text-white/70">自定义帧率 (60 - 120 fps)</p>
+                    <p className="text-xs font-medium text-white/70">自定义帧率 (30 - 120 fps)</p>
                     <div className="flex items-center gap-1.5">
-                      {[60, 90, 120].map((presetFps) => (
+                      {[30, 60, 90, 120].map((presetFps) => (
                         <button
                           key={presetFps}
                           type="button"
@@ -643,7 +671,7 @@ export const TrackPackageExportModal: React.FC<TrackPackageExportModalProps> = (
                   <div className="flex items-center gap-3">
                     <input
                       type="range"
-                      min={60}
+                      min={30}
                       max={120}
                       step={1}
                       value={clampedFps}
@@ -653,7 +681,7 @@ export const TrackPackageExportModal: React.FC<TrackPackageExportModalProps> = (
                     <div className="flex items-center gap-1 bg-black/35 border border-white/15 rounded-xl px-2.5 py-1 shrink-0">
                       <input
                         type="number"
-                        min={60}
+                        min={30}
                         max={120}
                         step={1}
                         value={targetFps}
@@ -740,7 +768,7 @@ export const TrackPackageExportModal: React.FC<TrackPackageExportModalProps> = (
                         onChange={(e) => setIncludeMvInVideo(e.target.checked)}
                         className="accent-rose-500 rounded"
                       />
-                      <span>将关联 MV 画面与前瞻/中段/后段融入效果视频（实时同步合成）</span>
+                      <span>将关联 MV 画面与前瞻/中段/后段融入效果视频（逐帧无丢帧高画质合成）</span>
                     </label>
                   </div>
                 )}
@@ -822,24 +850,30 @@ export const TrackPackageExportModal: React.FC<TrackPackageExportModalProps> = (
         {/* Footer */}
         <div className="flex flex-wrap items-center justify-between gap-3 px-5 sm:px-6 py-4 border-t border-white/10 bg-black/25 shrink-0">
           <div className="flex items-center gap-2 text-xs text-white/55">
-            {status === 'rendering' && includeMvInVideo && mvRecord && (
-              <button
-                type="button"
-                onClick={handleToggleMonitorMute}
-                className="px-3 py-1.5 rounded-xl bg-white/8 hover:bg-white/14 border border-white/12 text-white/85 flex items-center gap-1.5 cursor-pointer"
-              >
-                {monitorMuted ? (
-                  <>
-                    <VolumeX className="w-3.5 h-3.5" />
-                    <span>合成中已静音（点击监听）</span>
-                  </>
-                ) : (
-                  <>
-                    <Volume2 className="w-3.5 h-3.5 text-rose-300" />
-                    <span>正在监听合成声音</span>
-                  </>
-                )}
-              </button>
+            {status === 'rendering' &&
+              includeMvInVideo &&
+              mvRecord &&
+              progress.engineLabel.includes('MediaRecorder') && (
+                <button
+                  type="button"
+                  onClick={handleToggleMonitorMute}
+                  className="px-3 py-1.5 rounded-xl bg-white/8 hover:bg-white/14 border border-white/12 text-white/85 flex items-center gap-1.5 cursor-pointer"
+                >
+                  {monitorMuted ? (
+                    <>
+                      <VolumeX className="w-3.5 h-3.5" />
+                      <span>合成中已静音（点击监听）</span>
+                    </>
+                  ) : (
+                    <>
+                      <Volume2 className="w-3.5 h-3.5 text-rose-300" />
+                      <span>正在监听合成声音</span>
+                    </>
+                  )}
+                </button>
+              )}
+            {status === 'rendering' && !progress.engineLabel.includes('MediaRecorder') && (
+              <span>离线逐帧高画质合成中 · 帧率锁定无丢帧</span>
             )}
             {status !== 'rendering' && (
               <span>

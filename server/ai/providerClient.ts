@@ -1,10 +1,10 @@
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import {
-  AiProviderKind,
+  type AiProviderKind,
   checkAndIncrementProviderQuota,
   getStoredProviderWithKey,
   recordProviderProbeResult,
-  StoredAiProvider,
+  type StoredAiProvider,
 } from './keyVault.ts';
 
 export interface ModelCapabilities {

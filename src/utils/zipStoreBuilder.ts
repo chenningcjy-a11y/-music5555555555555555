@@ -6,23 +6,52 @@ export interface ZipPackageEntry {
 
 const textEncoder = new TextEncoder();
 
-// Precomputed IEEE 802.3 CRC32 lookup table
-const CRC32_TABLE = (() => {
-  const table = new Uint32Array(256);
+// Precomputed IEEE 802.3 CRC32 Slice-by-4 lookup tables (4x faster than byte-by-byte)
+const CRC32_TABLES: [Uint32Array, Uint32Array, Uint32Array, Uint32Array] = (() => {
+  const t0 = new Uint32Array(256);
+  const t1 = new Uint32Array(256);
+  const t2 = new Uint32Array(256);
+  const t3 = new Uint32Array(256);
   for (let i = 0; i < 256; i++) {
     let c = i;
     for (let k = 0; k < 8; k++) {
       c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
     }
-    table[i] = c >>> 0;
+    t0[i] = c >>> 0;
   }
-  return table;
+  for (let i = 0; i < 256; i++) {
+    t1[i] = (t0[t0[i] & 0xff] ^ (t0[i] >>> 8)) >>> 0;
+    t2[i] = (t0[t1[i] & 0xff] ^ (t1[i] >>> 8)) >>> 0;
+    t3[i] = (t0[t2[i] & 0xff] ^ (t2[i] >>> 8)) >>> 0;
+  }
+  return [t0, t1, t2, t3];
 })();
 
 function crc32Update(crc: number, bytes: Uint8Array): number {
-  let c = crc ^ 0xffffffff;
-  for (let i = 0; i < bytes.length; i++) {
-    c = CRC32_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  const [t0, t1, t2, t3] = CRC32_TABLES;
+  let c = (crc ^ 0xffffffff) >>> 0;
+  let i = 0;
+  const len = bytes.length;
+  const fastEnd = len - 3;
+
+  while (i < fastEnd) {
+    c ^=
+      bytes[i] |
+      (bytes[i + 1] << 8) |
+      (bytes[i + 2] << 16) |
+      (bytes[i + 3] << 24);
+    c =
+      (t3[c & 0xff] ^
+        t2[(c >>> 8) & 0xff] ^
+        t1[(c >>> 16) & 0xff] ^
+        t0[(c >>> 24) & 0xff]) >>>
+      0;
+    i += 4;
+  }
+
+  while (i < len) {
+    c = (t0[(c ^ bytes[i]) & 0xff] ^ (c >>> 8)) >>> 0;
+    i++;
   }
   return (c ^ 0xffffffff) >>> 0;
 }
@@ -31,15 +60,22 @@ async function computeBlobCrc32(
   blob: Blob,
   onSliceRead?: (bytesRead: number) => void
 ): Promise<number> {
-  const CHUNK_SIZE = 1024 * 1024; // 1 MB slices keep Android tablet RAM flat
+  const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB slices bound transient ArrayBuffer allocation
   let crc = 0;
   let offset = 0;
+  let sliceIdx = 0;
   while (offset < blob.size) {
     const end = Math.min(blob.size, offset + CHUNK_SIZE);
     const buf = await blob.slice(offset, end).arrayBuffer();
     crc = crc32Update(crc, new Uint8Array(buf));
+    const readBytes = end - offset;
     offset = end;
-    onSliceRead?.(end - offset);
+    sliceIdx++;
+    onSliceRead?.(readBytes);
+    // Yield periodically so mobile/tablet Chromium can reclaim 4MB slices and keep UI responsive
+    if (sliceIdx % 4 === 0 && offset < blob.size) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
   }
   return crc >>> 0;
 }
@@ -68,14 +104,31 @@ export function sanitizeFileName(name: string, fallback = 'untitled'): string {
 
 /**
  * Builds a universal UTF-8 ZIP (method 0 STORE) Blob directly from Blobs/Uint8Arrays/strings.
- * Because STORE keeps compressed media/audio/video untouched and streams CRC32 in 1 MB chunks,
- * even 150 MB+ song+MV bundles pack in milliseconds with minimal memory overhead.
+ * Processes large Blobs sequentially in 4 MB streaming slices with Slice-by-4 CRC32 so peak RAM stays minimal.
  */
-export async function buildZipBlob(entries: ZipPackageEntry[]): Promise<Blob> {
-  const parts: BlobPart[] = [];
-  const centralDirRecords: Uint8Array[] = [];
-  const { dosTime, dosDate } = toDosTimeDate(new Date());
-  let offset = 0;
+export async function buildZipBlob(
+  entries: ZipPackageEntry[],
+  onProgress?: (progress01: number) => void
+): Promise<Blob> {
+  let totalInputBytes = 0;
+  for (const entry of entries) {
+    if (typeof entry.data === 'string') {
+      totalInputBytes += entry.data.length;
+    } else if (entry.data instanceof Uint8Array) {
+      totalInputBytes += entry.data.byteLength;
+    } else {
+      totalInputBytes += entry.data.size;
+    }
+  }
+  const safeTotalBytes = Math.max(1, totalInputBytes);
+  let processedBytes = 0;
+
+  const prepared: Array<{
+    nameBytes: Uint8Array;
+    payloadBlob: Blob;
+    crc: number;
+    size: number;
+  }> = [];
 
   for (const entry of entries) {
     const cleanPath = entry.path.replace(/^\/+/, '').replace(/\\/g, '/');
@@ -88,16 +141,31 @@ export async function buildZipBlob(entries: ZipPackageEntry[]): Promise<Blob> {
       const bytes = textEncoder.encode(entry.data);
       crc = crc32Update(0, bytes);
       payloadBlob = new Blob([bytes]);
+      processedBytes += entry.data.length;
+      onProgress?.(Math.min(1, processedBytes / safeTotalBytes));
     } else if (entry.data instanceof Uint8Array) {
       crc = crc32Update(0, entry.data);
       const safeBytes = new Uint8Array(entry.data);
       payloadBlob = new Blob([safeBytes]);
+      processedBytes += entry.data.byteLength;
+      onProgress?.(Math.min(1, processedBytes / safeTotalBytes));
     } else {
       payloadBlob = entry.data;
-      crc = await computeBlobCrc32(payloadBlob);
+      crc = await computeBlobCrc32(payloadBlob, (bytesRead) => {
+        processedBytes += bytesRead;
+        onProgress?.(Math.min(1, processedBytes / safeTotalBytes));
+      });
     }
 
-    const size = payloadBlob.size;
+    prepared.push({ nameBytes, payloadBlob, crc, size: payloadBlob.size });
+  }
+
+  const parts: BlobPart[] = [];
+  const centralDirRecords: Uint8Array[] = [];
+  const { dosTime, dosDate } = toDosTimeDate(new Date());
+  let offset = 0;
+
+  for (const { nameBytes, payloadBlob, crc, size } of prepared) {
 
     // Local File Header (30 bytes + filename length)
     const localHeader = new ArrayBuffer(30 + nameBytes.length);
