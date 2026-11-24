@@ -60,8 +60,13 @@ export const AiToolboxTab: React.FC = () => {
   } = useTaskCenter();
 
   const {
+    providers,
+    selectedProviderId,
+    setSelectedProviderId,
     activeProvider,
     selectedModel,
+    setSelectedModel,
+    activeCapabilities,
     activeStemService,
     openAiCenter,
     beginTask,
@@ -131,7 +136,7 @@ export const AiToolboxTab: React.FC = () => {
   const handleRunLyricsTool = async () => {
     setLyricsError(null);
     setLyricsResult(null);
-    if (!currentTrack) {
+    if (!targetTrack) {
       setLyricsError('请先选择一首歌曲');
       return;
     }
@@ -140,8 +145,8 @@ export const AiToolboxTab: React.FC = () => {
       setLyricsError(check.error || 'AI 服务商未就绪');
       return;
     }
-    if (!currentTrack.lyricsRaw?.trim()) {
-      setLyricsError('当前曲目暂无歌词，请先点击「在线搜索与匹配歌词」或导入 LRC 文件');
+    if (!targetTrack.lyricsRaw?.trim()) {
+      setLyricsError('所选曲目暂无歌词，请先点击「在线搜索与匹配歌词」或导入 LRC 文件');
       return;
     }
 
@@ -151,8 +156,8 @@ export const AiToolboxTab: React.FC = () => {
       category: 'lyrics_assistant',
       providerName: activeProvider.name,
       modelName,
-      track: currentTrack,
-      trackTitle: currentTrack.title,
+      track: targetTrack,
+      trackTitle: targetTrack.title,
     });
 
     try {
@@ -160,11 +165,11 @@ export const AiToolboxTab: React.FC = () => {
         providerId: activeProvider.id,
         model: modelName,
         action: lyricsAction,
-        rawLyrics: currentTrack.lyricsRaw,
-        trackTitle: currentTrack.title,
-        artistName: currentTrack.artist,
+        rawLyrics: targetTrack.lyricsRaw,
+        trackTitle: targetTrack.title,
+        artistName: targetTrack.artist,
         targetLanguage: targetLang,
-        durationSec: currentTrack.duration,
+        durationSec: targetTrack.duration,
         signal,
       });
       setLyricsResult(res);
@@ -181,7 +186,7 @@ export const AiToolboxTab: React.FC = () => {
   const handleRunAnalysis = async () => {
     setAnalysisError(null);
     setAnalysisOutput(null);
-    if (!currentTrack) {
+    if (!targetTrack) {
       setAnalysisError('请先选择一首曲目');
       return;
     }
@@ -209,15 +214,15 @@ export const AiToolboxTab: React.FC = () => {
       category: 'audio_analysis',
       providerName: activeProvider.name,
       modelName,
-      track: currentTrack,
-      trackTitle: currentTrack.title,
+      track: targetTrack,
+      trackTitle: targetTrack.title,
     });
 
     try {
       const res = await runMusicAnalysisTask({
         providerId: activeProvider.id,
         model: modelName,
-        track: currentTrack,
+        track: targetTrack,
         analysisType,
         includeAudioSignal: requiresAudio,
         signal,
@@ -321,6 +326,107 @@ export const AiToolboxTab: React.FC = () => {
           );
         })}
       </div>
+
+      {/* Unified AI Engine & Target Track Bar for Lyrics / Analysis / DSP */}
+      {section !== 'separation' && (
+        <section className="rounded-2xl bg-white/[0.04] border border-white/10 p-4 space-y-3">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+            <label className="space-y-1">
+              <span className="text-white/55 block">AI 引擎（内置原生态 / 个人密钥）</span>
+              <select
+                value={selectedProviderId}
+                onChange={(e) => setSelectedProviderId(e.target.value)}
+                aria-label="选择工具箱 AI 引擎"
+                className="w-full px-3 py-2 rounded-xl bg-black/35 border border-white/15 text-xs sm:text-sm text-white outline-none cursor-pointer"
+              >
+                {providers.map((p) => (
+                  <option key={p.id} value={p.id} className="bg-[#180713]">
+                    {p.id === '__builtin_gemini__'
+                      ? p.name
+                      : `${p.name}${p.hasKey ? '' : '（未填密钥）'}`}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="space-y-1">
+              <span className="text-white/55 block">当前模型</span>
+              <select
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value)}
+                aria-label="选择工具箱 AI 模型"
+                className="w-full px-3 py-2 rounded-xl bg-black/35 border border-white/15 text-xs sm:text-sm text-white font-mono-tabular outline-none cursor-pointer"
+              >
+                {(activeProvider
+                  ? Array.from(
+                      new Set(
+                        [
+                          activeProvider.model,
+                          ...(activeProvider.availableModels || []),
+                        ].filter(Boolean)
+                      )
+                    )
+                  : []
+                ).map((m) => (
+                  <option key={m} value={m} className="bg-[#180713]">
+                    {m}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            {section !== 'dsp' ? (
+              <label className="space-y-1">
+                <span className="text-white/55 block">目标曲目</span>
+                <select
+                  value={targetTrack?.id || ''}
+                  onChange={(e) => {
+                    setTargetTrackId(e.target.value);
+                    setPinnedTarget(e.target.value !== currentTrack?.id);
+                  }}
+                  aria-label="选择目标曲目"
+                  className="w-full px-3 py-2 rounded-xl bg-black/35 border border-white/15 text-xs sm:text-sm text-white outline-none cursor-pointer truncate"
+                >
+                  {tracks.length === 0 ? (
+                    <option value="" className="bg-[#180713]">
+                      暂无曲目
+                    </option>
+                  ) : (
+                    tracks.map((t) => (
+                      <option key={t.id} value={t.id} className="bg-[#180713]">
+                        {t.title} · {t.artist}
+                      </option>
+                    ))
+                  )}
+                </select>
+              </label>
+            ) : (
+              <div className="space-y-1">
+                <span className="text-white/55 block">模型能力与调音目标</span>
+                <div className="px-3 py-2 rounded-xl bg-black/25 border border-white/10 text-xs text-white/80 truncate">
+                  {activeCapabilities.textReasoning ? '支持智能调音规划' : '未就绪'}
+                  {currentTrack ? ` · ${currentTrack.title}` : ''}
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-white/55">
+            <span>
+              {activeCapabilities.audioInputAnalysis
+                ? '当前模型支持真实音频波形听辨与多模态分析'
+                : '当前为纯文本模型（支持歌词翻译/校对与调音规划；真实音频听辨需切换原生态 Google Gemini 或支持音频的模型）'}
+            </span>
+            <button
+              type="button"
+              onClick={() => openAiCenter('providers')}
+              className="text-white/80 hover:text-white underline cursor-pointer"
+            >
+              管理密钥与服务商 →
+            </button>
+          </div>
+        </section>
+      )}
 
       {/* Tool A: Vocal & Instrumental Separation */}
       {section === 'separation' && (
@@ -478,7 +584,7 @@ export const AiToolboxTab: React.FC = () => {
               </button>
             )}
 
-            {currentTrackStemMeta && (
+            {targetStemMeta && (
               <>
                 <button
                   type="button"
@@ -530,7 +636,7 @@ export const AiToolboxTab: React.FC = () => {
             </div>
           )}
 
-          {currentTrackStemMeta && (
+          {targetStemMeta && (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 border-t border-white/10">
               <div className="space-y-1.5">
                 <div className="flex justify-between text-xs">
@@ -592,7 +698,7 @@ export const AiToolboxTab: React.FC = () => {
 
             <button
               type="button"
-              disabled={!currentTrack}
+              disabled={!targetTrack}
               onClick={() => setSearchOpen(true)}
               className="px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/16 border border-white/15 text-xs font-medium text-white cursor-pointer disabled:opacity-40 self-start"
             >
@@ -681,20 +787,20 @@ export const AiToolboxTab: React.FC = () => {
                   {lyricsResult.providerName} · {lyricsResult.modelUsed} ·{' '}
                   {lyricsResult.isTimedLrc ? '带时间戳 LRC 歌词（已保留原时间标签）' : '纯文本歌词'}
                 </span>
-                {currentTrack && (lyricsResult.bilingualLyrics || lyricsResult.correctedLyrics) && (
+                {targetTrack && (lyricsResult.bilingualLyrics || lyricsResult.correctedLyrics) && (
                   <button
                     type="button"
                     onClick={async () => {
                       const nextText =
                         lyricsResult.bilingualLyrics || lyricsResult.correctedLyrics || '';
                       if (!nextText) return;
-                      await updateTrackLyrics(currentTrack.id, nextText);
-                      showToast('已更新当前歌曲歌词');
+                      await updateTrackLyrics(targetTrack.id, nextText);
+                      showToast(`已更新「${targetTrack.title}」的歌词`);
                     }}
                     className="px-3 py-1.5 rounded-lg bg-emerald-500/25 hover:bg-emerald-500/35 border border-emerald-400/30 text-emerald-100 font-medium flex items-center gap-1 cursor-pointer"
                   >
                     <Check className="w-3.5 h-3.5" />
-                    <span>应用到当前曲目</span>
+                    <span>应用到所选曲目</span>
                   </button>
                 )}
               </div>
@@ -712,12 +818,12 @@ export const AiToolboxTab: React.FC = () => {
                   </pre>
                   {typeof lyricsResult.result.recommendedOffsetMs === 'number' &&
                     lyricsResult.result.recommendedOffsetMs !== 0 &&
-                    currentTrack && (
+                    targetTrack && (
                       <button
                         type="button"
                         onClick={async () => {
                           await updateLyricsOffset(
-                            currentTrack.id,
+                            targetTrack.id,
                             Number(lyricsResult.result?.recommendedOffsetMs || 0)
                           );
                           showToast('已更新全局歌词时间偏移');
@@ -952,13 +1058,13 @@ export const AiToolboxTab: React.FC = () => {
         </section>
       )}
 
-      {currentTrack && (
+      {targetTrack && (
         <LyricsSearchModal
           open={searchOpen}
-          track={currentTrack}
+          track={targetTrack}
           palette={activePalette}
           onClose={() => setSearchOpen(false)}
-          onApplyLyrics={(raw) => updateTrackLyrics(currentTrack.id, raw)}
+          onApplyLyrics={(raw) => updateTrackLyrics(targetTrack.id, raw)}
         />
       )}
     </div>

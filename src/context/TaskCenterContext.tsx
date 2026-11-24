@@ -22,12 +22,27 @@ import {
   ServerStemJobDto,
   submitServerStemJob,
 } from '../services/ai/musicSeparationService';
+import { buildStandalonePlayerHtml } from '../services/standalonePlayerHtml';
+import {
+  StageRenderController,
+  StageRenderPausedError,
+  StageVideoQuality,
+  startStageVideoRender,
+} from '../services/stageVideoRenderer';
 import {
   clearAiTasks,
+  clearMvExportCheckpoint,
   deleteAiTaskById,
   getAllAiTasks,
   getAudioBlob,
+  getMvExportCheckpointMeta,
+  getMvExportResult,
+  getMvRecordById,
+  getTrackMvs,
+  loadMvExportCheckpoint,
   saveAiTask,
+  saveMvExportCheckpoint,
+  saveMvExportResult,
   saveTrackStems,
 } from '../services/storage';
 import {
@@ -35,8 +50,25 @@ import {
   AiTaskRecord,
   AiTaskStageLog,
   AiTaskStatus,
+  MvExportResultMeta,
+  MvExportTaskConfig,
 } from '../types/ai';
-import { SeparationEngineMode, TrackMetadata, TrackStemsRecord } from '../types/music';
+import {
+  AnimationIntensity,
+  FontPresetId,
+  SeparationEngineMode,
+  TrackMetadata,
+  TrackMvRecord,
+  TrackStemsRecord,
+} from '../types/music';
+import { formatFileSize, formatTime } from '../utils/constants';
+import {
+  buildZipBlob,
+  sanitizeFileName,
+  saveEntriesToDirectoryHandle,
+  triggerBlobDownload,
+  ZipPackageEntry,
+} from '../utils/zipStoreBuilder';
 import type { WorkerInMessage, WorkerOutMessage } from '../workers/stemSeparatorWorker';
 import { useMusic } from './MusicContext';
 
@@ -54,11 +86,19 @@ export function isRunningOrQueuedStatus(status: AiTaskStatus): boolean {
 }
 
 interface TaskRunnerHandle {
-  kind: 'server-stem' | 'local-worker-stem' | 'abort-controller';
+  kind: 'server-stem' | 'local-worker-stem' | 'abort-controller' | 'mv-export';
   abortController?: AbortController;
   worker?: Worker;
+  mvController?: StageRenderController;
   paused?: boolean;
   cancelled?: boolean;
+}
+
+export interface EnqueueMvExportParams {
+  track: TrackMetadata;
+  mvRecord?: TrackMvRecord | null;
+  config: MvExportTaskConfig;
+  directoryHandle?: FileSystemDirectoryHandle | null;
 }
 
 interface BeginAdHocTaskParams {
@@ -85,8 +125,11 @@ interface TaskCenterContextValue {
     track: TrackMetadata,
     options?: { engineMode?: SeparationEngineMode }
   ) => Promise<string>;
+  enqueueMvExportTask: (params: EnqueueMvExportParams) => Promise<string>;
   getActiveStemTaskForTrack: (trackId: string) => AiTaskRecord | undefined;
   getLatestStemTaskForTrack: (trackId: string) => AiTaskRecord | undefined;
+  getLatestMvExportTaskForTrack: (trackId: string) => AiTaskRecord | undefined;
+  downloadMvExportResult: (taskId: string) => Promise<boolean>;
 
   beginAdHocTask: (params: BeginAdHocTaskParams) => {
     task: AiTaskRecord;
@@ -110,6 +153,25 @@ interface TaskCenterContextValue {
 }
 
 const TaskCenterContext = createContext<TaskCenterContextValue | null>(null);
+
+async function dataUrlToBlobHelper(
+  dataUrl: string
+): Promise<{ blob: Blob; ext: string } | null> {
+  try {
+    const res = await fetch(dataUrl);
+    const blob = await res.blob();
+    const mime = blob.type || 'image/png';
+    const ext =
+      mime.includes('jpeg') || mime.includes('jpg')
+        ? 'jpg'
+        : mime.includes('webp')
+        ? 'webp'
+        : 'png';
+    return { blob, ext };
+  } catch {
+    return null;
+  }
+}
 
 function makeTaskId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -174,6 +236,9 @@ export const TaskCenterProvider: React.FC<{ children: React.ReactNode }> = ({
   const runnersRef = useRef<Map<string, TaskRunnerHandle>>(new Map());
   const localQueueRef = useRef<Array<() => Promise<void>>>([]);
   const localWorkerBusyRef = useRef(false);
+  const mvExportQueueRef = useRef<Array<() => Promise<void>>>([]);
+  const mvExportBusyRef = useRef(false);
+  const mvExportDirHandlesRef = useRef<Map<string, FileSystemDirectoryHandle>>(new Map());
   const hydratedRef = useRef(false);
 
   const upsertTaskState = useCallback(
@@ -847,6 +912,480 @@ export const TaskCenterProvider: React.FC<{ children: React.ReactNode }> = ({
     return { task, signal: ctrl.signal };
   }, []);
 
+  const pumpMvExportQueue = useCallback(() => {
+    if (mvExportBusyRef.current) return;
+    const nextJob = mvExportQueueRef.current.shift();
+    if (!nextJob) return;
+    mvExportBusyRef.current = true;
+    void nextJob().finally(() => {
+      mvExportBusyRef.current = false;
+      pumpMvExportQueue();
+    });
+  }, []);
+
+  const launchMvExportExecution = useCallback(
+    (
+      taskId: string,
+      track: TrackMetadata,
+      mvRecordInput: TrackMvRecord | null,
+      config: MvExportTaskConfig,
+      resumeFromCheckpoint: boolean
+    ) => {
+      const runnerHandle: TaskRunnerHandle = {
+        kind: 'mv-export',
+        paused: false,
+        cancelled: false,
+      };
+      runnersRef.current.set(taskId, runnerHandle);
+
+      const run = async () => {
+        if (runnerHandle.cancelled || runnerHandle.paused) return;
+
+        let latestPercent = 0;
+        let hasCheckpointSaved = false;
+
+        try {
+          updateTask(
+            taskId,
+            {
+              status: 'running',
+              errorMessage: undefined,
+              stageLabel: resumeFromCheckpoint
+                ? '正在检查断点缓存与 MV 资源…'
+                : '正在加载原曲音频与 MV 素材…',
+            },
+            resumeFromCheckpoint ? '恢复后台 MV 导出任务' : '开始后台 MV 导出任务'
+          );
+
+          const audioBlob = await getAudioBlob(track.id);
+          if (!audioBlob) {
+            throw new Error('本地曲库中未找到该曲目的音频数据，无法导出。');
+          }
+
+          let mvRecord = mvRecordInput;
+          if (config.includeMvInVideo && !mvRecord) {
+            if (config.mvId) {
+              mvRecord = (await getMvRecordById(config.mvId)) || null;
+            }
+            if (!mvRecord) {
+              const allMvs = await getTrackMvs(track.id);
+              mvRecord = allMvs.find((m) => m.isActive) || allMvs[0] || null;
+            }
+          }
+
+          let loadedCp: Awaited<ReturnType<typeof loadMvExportCheckpoint>> = null;
+          if (resumeFromCheckpoint) {
+            loadedCp = await loadMvExportCheckpoint(taskId);
+            if (loadedCp && loadedCp.meta.nextFrameIdx > 0) {
+              hasCheckpointSaved = true;
+              latestPercent = Math.min(
+                96,
+                Math.round((loadedCp.meta.nextFrameIdx / Math.max(1, loadedCp.meta.totalFrames)) * 96)
+              );
+            }
+          }
+
+          if (runnerHandle.cancelled) {
+            await clearMvExportCheckpoint(taskId);
+            finishTask(taskId, 'cancelled', {
+              stageLabel: '已取消导出',
+              errorMessage: '用户手动取消导出',
+              hasResumableCheckpoint: false,
+            });
+            return;
+          }
+
+          if (runnerHandle.paused) {
+            updateTask(taskId, {
+              status: 'paused',
+              hasResumableCheckpoint: hasCheckpointSaved,
+              stageLabel: hasCheckpointSaved
+                ? `已暂停导出 · 已保留 ${latestPercent}% 断点进度`
+                : '已暂停导出',
+              estimatedRemainingSec: null,
+            });
+            return;
+          }
+
+          let lastUiCommitPerf = -1000;
+          let lastUiPct = -1;
+          const renderWallStartPerf = performance.now();
+          const startPct = loadedCp
+            ? Math.min(96, Math.round((loadedCp.meta.nextFrameIdx / Math.max(1, loadedCp.meta.totalFrames)) * 96))
+            : 0;
+
+          const ctrl = startStageVideoRender({
+            track,
+            audioBlob,
+            mvRecord: config.includeMvInVideo ? mvRecord : null,
+            includeMvInVideo: Boolean(config.includeMvInVideo && mvRecord),
+            includeMvIntro: config.includeMvIntro,
+            includeMvMidBreaks: config.includeMvMidBreaks,
+            includeMvOutro: config.includeMvOutro,
+            showBilingual: config.showBilingual,
+            showWordSync: config.showWordSync,
+            fontPreset: (config.fontPreset as FontPresetId | undefined) || 'modern',
+            animationIntensity: config.animationIntensity as AnimationIntensity,
+            quality: config.quality as StageVideoQuality,
+            fps: config.fps,
+            startOffsetSec: config.durationMode === 'custom' ? config.startOffsetSec : 0,
+            clipDurationSec: config.durationMode === 'custom' ? config.clipDurationSec : null,
+            mvUiFadeInSec: config.mvUiFadeInSec,
+            mvUiFadeOutSec: config.mvUiFadeOutSec,
+            previewCanvas: null,
+            monitorMuted: true,
+            checkpointTaskId: taskId,
+            resumeCheckpoint: loadedCp,
+            onCheckpoint: async (meta, newBatch) => {
+              await saveMvExportCheckpoint(meta, newBatch);
+              hasCheckpointSaved = true;
+            },
+            onProgress: (info) => {
+              const roundedPct = Math.max(0, Math.min(99, Math.round(info.percent)));
+              latestPercent = roundedPct;
+              const nowP = performance.now();
+              if (roundedPct !== lastUiPct && nowP - lastUiCommitPerf >= 320) {
+                lastUiCommitPerf = nowP;
+                lastUiPct = roundedPct;
+                let etaSec: number | null = null;
+                const elapsedWall = (nowP - renderWallStartPerf) / 1000;
+                const deltaPct = roundedPct - startPct;
+                if (elapsedWall > 2 && deltaPct >= 1 && roundedPct < 98) {
+                  etaSec = Math.max(
+                    1,
+                    Math.round((elapsedWall * (98 - roundedPct)) / deltaPct)
+                  );
+                }
+                updateTask(taskId, {
+                  status: 'running',
+                  progress: roundedPct,
+                  stageLabel: info.phaseLabel,
+                  engineLabel: info.engineLabel,
+                  hasResumableCheckpoint: hasCheckpointSaved,
+                  estimatedRemainingSec: etaSec,
+                });
+              }
+            },
+          });
+
+          runnerHandle.mvController = ctrl;
+          if (runnerHandle.cancelled) {
+            ctrl.cancel();
+          } else if (runnerHandle.paused) {
+            ctrl.pause();
+          }
+
+          const result = await ctrl.promise;
+          runnerHandle.mvController = undefined;
+
+          if (runnerHandle.cancelled) {
+            await clearMvExportCheckpoint(taskId);
+            finishTask(taskId, 'cancelled', {
+              stageLabel: '已取消导出',
+              errorMessage: '用户手动取消导出',
+              hasResumableCheckpoint: false,
+            });
+            return;
+          }
+
+          const folderName = sanitizeFileName(
+            `${track.title} - ${track.artist}`,
+            'LuminaTrack'
+          );
+          const audioExt =
+            (track.format || 'mp3').toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp3';
+          const safeTitle = sanitizeFileName(track.title, 'track');
+          const videoFileName = `${safeTitle} - 网页同款播放效果视频.${result.extension}`;
+
+          let finalBlob = result.videoBlob;
+          let finalFileName = videoFileName;
+          let finalMimeType = result.mimeType;
+          let savedFolderName: string | undefined;
+          let manifestPaths: Array<{ path: string; sizeText: string }> = [
+            { path: videoFileName, sizeText: formatFileSize(result.videoBlob.size) },
+          ];
+
+          if (config.deliveryMode !== 'video-only') {
+            updateTask(
+              taskId,
+              {
+                status: 'running',
+                progress: 98,
+                stageLabel: `正在后台打包「${folderName}/」歌曲文件夹…`,
+              },
+              '打包离线歌曲文件夹'
+            );
+
+            const audioRelPath = `音频/${folderName}.${audioExt}`;
+            let coverRelPath = '';
+            let coverBlobInfo: { blob: Blob; ext: string } | null = null;
+            if (track.coverDataUrl) {
+              coverBlobInfo = await dataUrlToBlobHelper(track.coverDataUrl);
+              if (coverBlobInfo) {
+                coverRelPath = `专辑封面/${safeTitle}.${coverBlobInfo.ext}`;
+              }
+            }
+
+            const lyricsRelPath = track.lyricsRaw?.trim() ? `歌词/${safeTitle}.lrc` : '';
+            let mvRelPath = '';
+            if (mvRecord?.videoBlob) {
+              const mvExt =
+                mvRecord.fileName
+                  .split('.')
+                  .pop()
+                  ?.toLowerCase()
+                  .replace(/[^a-z0-9]/g, '') || 'mp4';
+              mvRelPath = `MV/${safeTitle} - MV.${mvExt}`;
+            }
+
+            const htmlStr = buildStandalonePlayerHtml({
+              track,
+              audioRelPath: `./${audioRelPath}`,
+              mvRelPath: mvRelPath ? `./${mvRelPath}` : undefined,
+              mvMeta: mvRecord || null,
+              coverRelPath: coverRelPath ? `./${coverRelPath}` : undefined,
+              lyricsRelPath: lyricsRelPath ? `./${lyricsRelPath}` : undefined,
+              videoRelPath: `./${videoFileName}`,
+              fontPreset: (config.fontPreset as FontPresetId | undefined) || 'modern',
+              showBilingual: config.showBilingual,
+            });
+
+            const entries: ZipPackageEntry[] = [
+              { path: `${folderName}/${videoFileName}`, data: result.videoBlob },
+              { path: `${folderName}/音乐播放器 - ${safeTitle}.html`, data: htmlStr },
+              { path: `${folderName}/${audioRelPath}`, data: audioBlob },
+            ];
+
+            if (mvRecord?.videoBlob && mvRelPath) {
+              entries.push({ path: `${folderName}/${mvRelPath}`, data: mvRecord.videoBlob });
+              entries.push({
+                path: `${folderName}/MV/mv-timeline.json`,
+                data: JSON.stringify(mvRecord.timeline, null, 2),
+              });
+            }
+            if (coverBlobInfo && coverRelPath) {
+              entries.push({ path: `${folderName}/${coverRelPath}`, data: coverBlobInfo.blob });
+            }
+            if (lyricsRelPath && track.lyricsRaw) {
+              entries.push({ path: `${folderName}/${lyricsRelPath}`, data: track.lyricsRaw });
+            }
+
+            manifestPaths = entries.map((e) => ({
+              path: e.path,
+              sizeText:
+                typeof e.data === 'string'
+                  ? formatFileSize(new Blob([e.data]).size)
+                  : formatFileSize(
+                      e.data instanceof Uint8Array ? e.data.byteLength : e.data.size
+                    ),
+            }));
+
+            const pickedDir = mvExportDirHandlesRef.current.get(taskId);
+            if (config.deliveryMode === 'local-dir' && pickedDir) {
+              const saved = await saveEntriesToDirectoryHandle(
+                pickedDir,
+                folderName,
+                entries
+              );
+              savedFolderName = saved.folderName;
+              mvExportDirHandlesRef.current.delete(taskId);
+            } else {
+              let lastZipUiPct = -1;
+              finalBlob = await buildZipBlob(entries, (p01) => {
+                const pct = Math.round(p01 * 100);
+                if (pct !== lastZipUiPct && pct % 10 === 0) {
+                  lastZipUiPct = pct;
+                  updateTask(taskId, {
+                    status: 'running',
+                    progress: 99,
+                    stageLabel: `正在流式校验并打包「${folderName}.zip」(${pct}%)…`,
+                  });
+                }
+              });
+              finalFileName = `${folderName}.zip`;
+              finalMimeType = 'application/zip';
+            }
+          }
+
+          await saveMvExportResult({
+            taskId,
+            fileName: finalFileName,
+            mimeType: finalMimeType,
+            sizeBytes: finalBlob.size,
+            blob: finalBlob,
+            createdAt: Date.now(),
+          });
+
+          if (!savedFolderName) {
+            triggerBlobDownload(finalBlob, finalFileName);
+          }
+
+          await clearMvExportCheckpoint(taskId);
+
+          const resultMeta: MvExportResultMeta = {
+            fileName: finalFileName,
+            mimeType: finalMimeType,
+            sizeBytes: finalBlob.size,
+            durationSec: result.durationSec,
+            width: result.width,
+            height: result.height,
+            fps: result.fps,
+            deliveryMode: config.deliveryMode,
+            manifestPaths,
+            savedToLocalFolderName: savedFolderName,
+            createdAt: Date.now(),
+          };
+
+          finishTask(taskId, 'completed', {
+            stageLabel: savedFolderName
+              ? `后台导出完成并已写入「${savedFolderName}」`
+              : `后台导出完成并已触发下载：${finalFileName}`,
+            resultSummary: `${result.width}×${result.height} · ${result.fps} fps · ${formatTime(
+              result.durationSec
+            )} · ${formatFileSize(finalBlob.size)}`,
+            mvExportResult: resultMeta,
+            hasResumableCheckpoint: false,
+          });
+          showToast(
+            savedFolderName
+              ? `「${track.title}」导出完成并写入文件夹「${savedFolderName}」`
+              : `「${track.title}」MV 导出完成，已自动开始下载`
+          );
+        } catch (err) {
+          runnerHandle.mvController = undefined;
+          mvExportDirHandlesRef.current.delete(taskId);
+          if (err instanceof StageRenderPausedError || runnerHandle.paused) {
+            runnersRef.current.delete(taskId);
+            updateTask(
+              taskId,
+              {
+                status: 'paused',
+                hasResumableCheckpoint: hasCheckpointSaved,
+                estimatedRemainingSec: null,
+                stageLabel: hasCheckpointSaved
+                  ? `已暂停导出 · 已保留 ${latestPercent}% 断点进度，点击「继续」可续传`
+                  : '已暂停导出（可在任务中心继续）',
+              },
+              '暂停并保存导出断点'
+            );
+            return;
+          }
+          const msg = err instanceof Error ? err.message : '导出失败';
+          if (runnerHandle.cancelled || msg.includes('已取消')) {
+            await clearMvExportCheckpoint(taskId);
+            finishTask(taskId, 'cancelled', {
+              stageLabel: '已取消导出',
+              errorMessage: '用户手动取消导出任务',
+              hasResumableCheckpoint: false,
+            });
+          } else {
+            finishTask(taskId, 'error', {
+              stageLabel: 'MV 导出失败',
+              errorMessage: msg,
+              hasResumableCheckpoint: hasCheckpointSaved,
+            });
+            showToast(`「${track.title}」MV 导出失败：${msg}`);
+          }
+        }
+      };
+
+      mvExportQueueRef.current.push(run);
+      pumpMvExportQueue();
+    },
+    [finishTask, pumpMvExportQueue, showToast, updateTask]
+  );
+
+  const enqueueMvExportTask = useCallback(
+    async ({
+      track,
+      mvRecord,
+      config,
+      directoryHandle,
+    }: EnqueueMvExportParams): Promise<string> => {
+      const now = Date.now();
+      const taskId = makeTaskId();
+      if (directoryHandle) {
+        mvExportDirHandlesRef.current.set(taskId, directoryHandle);
+      }
+
+      const segmentTags: string[] = [];
+      if (config.includeMvInVideo && mvRecord) {
+        if (config.includeMvIntro) segmentTags.push('前瞻');
+        if (config.includeMvMidBreaks) segmentTags.push('中段剧情');
+        if (config.includeMvOutro) segmentTags.push('尾声');
+      }
+      const segmentText =
+        config.includeMvInVideo && mvRecord
+          ? segmentTags.length > 0
+            ? `含 MV（${segmentTags.join(' + ')}）`
+            : '含 MV（仅主歌同步画面）'
+          : '纯网页舞台视觉';
+
+      const task: AiTaskRecord = {
+        id: taskId,
+        taskName: `导出合成 · ${track.title}`,
+        category: 'mv_export',
+        providerName: 'WebCodecs 离线合成引擎',
+        modelName: `${config.quality.toUpperCase()} · ${config.fps} fps`,
+        sourceTrackId: track.id,
+        sourceTrackTitle: track.title,
+        sourceTrackArtist: track.artist,
+        sourceTrackAlbum: track.album,
+        sourceTrackCoverUrl: track.coverDataUrl,
+        trackTitle: track.title,
+        sourceFileInfo: {
+          format: track.format,
+          fileSizeBytes: track.fileSize,
+          durationSec: track.duration,
+          sampleRate: track.sampleRate,
+          bitrate: track.bitrate,
+          fileIdentifier: `${track.id}.${(track.format || 'audio').toLowerCase()}`,
+        },
+        engineMode: 'local',
+        engineLabel: segmentText,
+        createdAt: now,
+        startedAt: now,
+        status: 'queued',
+        progress: 0,
+        stageLabel: '已加入后台导出队列，切歌或切换页面均不会中断…',
+        estimatedRemainingSec: null,
+        mvExportConfig: config,
+        hasResumableCheckpoint: false,
+        stageLogs: [
+          {
+            timestamp: now,
+            stage: '创建后台 MV 导出任务',
+            detail: `${config.quality.toUpperCase()} · ${config.fps} fps · ${segmentText}`,
+          },
+        ],
+        replayPayload: {
+          category: 'mv_export',
+          targetTrackId: track.id,
+        },
+      };
+
+      setTasks((prev) => [task, ...prev].slice(0, 200));
+      await saveAiTask(task);
+      launchMvExportExecution(taskId, track, mvRecord || null, config, false);
+      return taskId;
+    },
+    [launchMvExportExecution]
+  );
+
+  const downloadMvExportResult = useCallback(
+    async (taskId: string): Promise<boolean> => {
+      const rec = await getMvExportResult(taskId);
+      if (!rec) {
+        showToast('本地暂存的导出文件已清理，可点击「重新导出」再次生成');
+        return false;
+      }
+      triggerBlobDownload(rec.blob, rec.fileName);
+      showToast(`已开始下载：${rec.fileName}`);
+      return true;
+    },
+    [showToast]
+  );
+
   const pauseTask = useCallback(
     async (taskId: string) => {
       const task = tasksRef.current.find((t) => t.id === taskId);
@@ -886,6 +1425,34 @@ export const TaskCenterProvider: React.FC<{ children: React.ReactNode }> = ({
           { status: 'paused', stageLabel: '正在当前分段结束后暂停…' },
           '请求暂停本地推理'
         );
+        return;
+      }
+
+      if (runner?.kind === 'mv-export') {
+        runner.paused = true;
+        if (runner.mvController) {
+          runner.mvController.pause();
+          updateTask(
+            taskId,
+            {
+              status: 'paused',
+              stageLabel: '正在保存当前关键帧断点并暂停导出…',
+              estimatedRemainingSec: null,
+            },
+            '请求暂停导出并保存断点'
+          );
+        } else {
+          runnersRef.current.delete(taskId);
+          updateTask(
+            taskId,
+            {
+              status: 'paused',
+              stageLabel: '已暂停排队导出',
+              estimatedRemainingSec: null,
+            },
+            '暂停排队中的导出任务'
+          );
+        }
       }
     },
     [showToast, updateTask]
@@ -922,6 +1489,31 @@ export const TaskCenterProvider: React.FC<{ children: React.ReactNode }> = ({
         return;
       }
 
+      if (task.category === 'mv_export' && task.mvExportConfig) {
+        const activeRunner = runnersRef.current.get(taskId);
+        if (activeRunner && activeRunner.mvController && !activeRunner.paused) {
+          return;
+        }
+        const targetTrackId = task.sourceTrackId || task.mvExportConfig.trackId;
+        const targetTrack = tracksRef.current.find((t) => t.id === targetTrackId);
+        if (!targetTrack) {
+          showToast('曲库中已找不到该任务对应的原始歌曲，无法继续导出');
+          return;
+        }
+        updateTask(
+          taskId,
+          {
+            status: 'queued',
+            errorMessage: undefined,
+            stageLabel: '正在加入队列并从已保存断点继续导出…',
+          },
+          '从断点恢复后台导出'
+        );
+        launchMvExportExecution(taskId, targetTrack, null, task.mvExportConfig, true);
+        showToast(`已继续导出「${targetTrack.title}」`);
+        return;
+      }
+
       const runner = runnersRef.current.get(taskId);
       if (runner?.kind === 'local-worker-stem' && runner.worker) {
         runner.paused = false;
@@ -929,7 +1521,7 @@ export const TaskCenterProvider: React.FC<{ children: React.ReactNode }> = ({
         updateTask(taskId, { status: 'running', stageLabel: '继续本地分离…' }, '恢复本地推理');
       }
     },
-    [pollServerJobUntilTerminal, showToast, updateTask]
+    [launchMvExportExecution, pollServerJobUntilTerminal, showToast, updateTask]
   );
 
   const cancelTask = useCallback(
@@ -943,8 +1535,16 @@ export const TaskCenterProvider: React.FC<{ children: React.ReactNode }> = ({
         if (runner.worker) {
           runner.worker.postMessage({ type: 'cancel' } satisfies WorkerInMessage);
         }
+        if (runner.mvController) {
+          runner.mvController.cancel();
+        }
         runner.abortController?.abort();
         runnersRef.current.delete(taskId);
+      }
+
+      if (task.category === 'mv_export') {
+        mvExportDirHandlesRef.current.delete(taskId);
+        await clearMvExportCheckpoint(taskId);
       }
 
       if (task.backendJobId) {
@@ -954,6 +1554,7 @@ export const TaskCenterProvider: React.FC<{ children: React.ReactNode }> = ({
       finishTask(taskId, 'cancelled', {
         stageLabel: '已取消任务',
         errorMessage: '用户手动取消任务',
+        hasResumableCheckpoint: false,
       });
       showToast(`已取消任务「${task.sourceTrackTitle || task.taskName}」`);
     },
@@ -964,6 +1565,33 @@ export const TaskCenterProvider: React.FC<{ children: React.ReactNode }> = ({
     async (taskId: string) => {
       const task = tasksRef.current.find((t) => t.id === taskId);
       if (!task) return;
+
+      if (task.category === 'mv_export' && task.mvExportConfig) {
+        const targetTrackId = task.sourceTrackId || task.mvExportConfig.trackId;
+        const targetTrack = tracksRef.current.find((t) => t.id === targetTrackId);
+        if (!targetTrack) {
+          showToast('曲库中已找不到该任务对应的原始歌曲，无法重新导出');
+          return;
+        }
+        await clearMvExportCheckpoint(taskId);
+        updateTask(
+          taskId,
+          {
+            status: 'queued',
+            progress: 0,
+            startedAt: Date.now(),
+            finishedAt: undefined,
+            errorMessage: undefined,
+            mvExportResult: undefined,
+            hasResumableCheckpoint: false,
+            estimatedRemainingSec: null,
+            stageLabel: '正在从头重新开始后台 MV 导出…',
+          },
+          '用户发起重新导出'
+        );
+        launchMvExportExecution(taskId, targetTrack, null, task.mvExportConfig, false);
+        return;
+      }
 
       if (task.category === 'stem_separation') {
         const targetTrackId = task.sourceTrackId || task.replayPayload?.targetTrackId;
@@ -1025,6 +1653,7 @@ export const TaskCenterProvider: React.FC<{ children: React.ReactNode }> = ({
     },
     [
       launchLocalWorkerStemExecution,
+      launchMvExportExecution,
       launchRemoteDemucsExecution,
       launchServerStemExecution,
       separationEngineMode,
@@ -1042,6 +1671,7 @@ export const TaskCenterProvider: React.FC<{ children: React.ReactNode }> = ({
       if (task?.backendJobId) {
         void deleteServerStemJobApi(task.backendJobId);
       }
+      mvExportDirHandlesRef.current.delete(taskId);
       await deleteAiTaskById(taskId);
       setTasks((prev) => prev.filter((t) => t.id !== taskId));
       setSelectedTaskId((prev) => (prev === taskId ? null : prev));
@@ -1071,22 +1701,25 @@ export const TaskCenterProvider: React.FC<{ children: React.ReactNode }> = ({
   );
 
   const clearCompletedOrAllTasks = useCallback(async () => {
-    const active = tasksRef.current.filter((t) => isRunningOrQueuedStatus(t.status));
-    if (active.length === 0) {
+    const keepActive = tasksRef.current.filter(
+      (t) =>
+        isRunningOrQueuedStatus(t.status) ||
+        (t.category === 'mv_export' && t.status === 'interrupted')
+    );
+    if (keepActive.length === 0) {
       await clearAiTasks();
       setTasks([]);
       setSelectedTaskId(null);
       showToast('已清空任务记录');
       return;
     }
-    const inactiveIds = tasksRef.current
-      .filter((t) => !isRunningOrQueuedStatus(t.status))
-      .map((t) => t.id);
-    for (const id of inactiveIds) {
+    const keepIds = new Set(keepActive.map((t) => t.id));
+    const removeIds = tasksRef.current.filter((t) => !keepIds.has(t.id)).map((t) => t.id);
+    for (const id of removeIds) {
       await deleteAiTaskById(id);
     }
-    setTasks(active);
-    showToast('已清空已结束的任务记录，进行中的任务继续保留');
+    setTasks(keepActive);
+    showToast('已清空已结束的任务记录，进行中及可续传任务继续保留');
   }, [showToast]);
 
   const reconcileAndHydrateTasks = useCallback(async () => {
@@ -1095,6 +1728,43 @@ export const TaskCenterProvider: React.FC<{ children: React.ReactNode }> = ({
       setTasks(stored);
 
       for (const task of stored) {
+        if (task.category === 'mv_export') {
+          if (task.status === 'running' || task.status === 'queued') {
+            const cpMeta = await getMvExportCheckpointMeta(task.id);
+            const hasCp = Boolean(cpMeta && cpMeta.nextFrameIdx > 0);
+            const preservedPct = hasCp && cpMeta
+              ? Math.max(
+                  task.progress,
+                  Math.min(
+                    96,
+                    Math.round((cpMeta.nextFrameIdx / Math.max(1, cpMeta.totalFrames)) * 96)
+                  )
+                )
+              : task.progress;
+
+            finishTask(task.id, 'interrupted', {
+              progress: preservedPct,
+              hasResumableCheckpoint: hasCp,
+              stageLabel: hasCp
+                ? `页面中断 · 已保留 ${preservedPct}% 编码断点，点击「继续」即可接着合成`
+                : '页面刷新或关闭导致导出中断（点击「继续」可立即恢复）',
+              errorMessage: hasCp
+                ? '页面意外刷新或关闭，但系统已自动保留编码断点缓存；点击「继续」即可从上次进度无缝续传，无需重头开始。'
+                : '页面刷新前尚未生成首个断点（每 6 秒自动保存），点击「继续」可立即继续导出。',
+            });
+            continue;
+          }
+
+          if (task.status === 'paused') {
+            const cpMeta = await getMvExportCheckpointMeta(task.id);
+            const hasCp = Boolean(cpMeta && cpMeta.nextFrameIdx > 0);
+            if (Boolean(task.hasResumableCheckpoint) !== hasCp) {
+              updateTask(task.id, { hasResumableCheckpoint: hasCp });
+            }
+          }
+          continue;
+        }
+
         if (!isRunningOrQueuedStatus(task.status)) continue;
 
         if (task.backendJobId && task.sourceTrackId) {
@@ -1213,14 +1883,14 @@ export const TaskCenterProvider: React.FC<{ children: React.ReactNode }> = ({
     setTasks(stored);
   }, []);
 
-  // Warn before unloading tab ONLY when a browser-local Web Worker separation is running
+  // Warn before unloading tab when a browser-local Web Worker or MV export is actively running
   const hasLocalBackgroundTask = useMemo(
     () =>
       tasks.some(
         (t) =>
           (t.status === 'running' || t.status === 'queued') &&
           !t.backendJobId &&
-          t.category === 'stem_separation'
+          (t.category === 'stem_separation' || t.category === 'mv_export')
       ),
     [tasks]
   );
@@ -1251,6 +1921,12 @@ export const TaskCenterProvider: React.FC<{ children: React.ReactNode }> = ({
       tasks.find(
         (t) => t.category === 'stem_separation' && t.sourceTrackId === trackId
       ),
+    [tasks]
+  );
+
+  const getLatestMvExportTaskForTrack = useCallback(
+    (trackId: string) =>
+      tasks.find((t) => t.category === 'mv_export' && t.sourceTrackId === trackId),
     [tasks]
   );
 
@@ -1287,8 +1963,11 @@ export const TaskCenterProvider: React.FC<{ children: React.ReactNode }> = ({
     completedCount,
     failedCount,
     enqueueStemSeparationTask,
+    enqueueMvExportTask,
     getActiveStemTaskForTrack,
     getLatestStemTaskForTrack,
+    getLatestMvExportTaskForTrack,
+    downloadMvExportResult,
     beginAdHocTask,
     updateTask,
     finishTask,

@@ -5,9 +5,8 @@ import fsp from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { GoogleGenAI, Type } from '@google/genai';
 import { createAiRouter } from './server/ai/taskRoutes.ts';
-import { getStoredProviderWithKey } from './server/ai/keyVault.ts';
 import {
   downloadRemoteImageAsDataUrl,
   searchArtistAvatarPortraits,
@@ -15,6 +14,8 @@ import {
 import {
   callProviderTextCompletion,
   extractJsonFromLlmText,
+  parseGeminiModelSpec,
+  resolveEffectiveProviderWithKey,
 } from './server/ai/providerClient.ts';
 import {
   cancelServerStemJob,
@@ -650,43 +651,15 @@ async function startServer() {
       let actualProviderName = '内置 Gemini';
       let actualModelUsed = 'gemini-4-hydrogen';
 
-      const forceBuiltin = providerId === '__builtin_gemini__';
-      const resolved = forceBuiltin
-        ? null
-        : await getStoredProviderWithKey(providerId || undefined);
-
-      // If caller explicitly chose a non-builtin provider (e.g. DeepSeek), NEVER silently replace it with built-in Gemini
-      if (providerId && !forceBuiltin) {
-        if (!resolved) {
-          res.status(400).json({
-            error: `未找到所选 AI 服务商 (${providerId})，请在「AI 智能中心 → API 服务管理」检查配置。`,
-          });
-          return;
-        }
-        if (!resolved.provider.enabled) {
-          res.status(400).json({
-            error: `所选 AI 服务商「${resolved.provider.name}」已被禁用，请先在「API 服务管理」中启用。`,
-          });
-          return;
-        }
-        if (!resolved.apiKey) {
-          res.status(400).json({
-            error: `所选 AI 服务商「${resolved.provider.name}」尚未配置 API Key，请前往「API 服务管理」填写您的密钥后再试。`,
-          });
-          return;
-        }
+      const resolvedRes = await resolveEffectiveProviderWithKey(providerId || undefined);
+      if (!resolvedRes.ok) {
+        res.status(400).json({ error: resolvedRes.error });
+        return;
       }
 
-      const shouldUseUserProvider = Boolean(
-        !forceBuiltin &&
-          resolved &&
-          resolved.provider.enabled &&
-          resolved.apiKey
-      );
-
-      if (shouldUseUserProvider && resolved) {
-        const effectiveModel = (modelName || resolved.provider.model || '').trim();
-        actualProviderName = resolved.provider.name;
+      if (!resolvedRes.isBuiltin) {
+        const effectiveModel = (modelName || resolvedRes.provider.model || '').trim();
+        actualProviderName = resolvedRes.provider.name;
         actualModelUsed = effectiveModel;
 
         const userPrompt = JSON.stringify({
@@ -709,8 +682,8 @@ Guidelines:
 {"translations": [{"idx": 0, "translation": "..."}]}`;
 
         const responseText = await callProviderTextCompletion({
-          provider: resolved.provider,
-          apiKey: resolved.apiKey,
+          provider: resolvedRes.provider,
+          apiKey: resolvedRes.apiKey,
           modelOverride: effectiveModel,
           systemInstruction,
           userPrompt,
@@ -736,20 +709,21 @@ Guidelines:
 
         if (!Array.isArray(translations) || translations.length === 0) {
           throw new Error(
-            `${resolved.provider.name} (${effectiveModel}) 返回的翻译 JSON 格式缺少 translations 数组，请重试`
+            `${resolvedRes.provider.name} (${effectiveModel}) 返回的翻译 JSON 格式缺少 translations 数组，请重试`
           );
         }
       } else {
         const ai = getGeminiClient();
-        const geminiModel =
-          modelName && modelName.startsWith('gemini-')
+        const { baseModel, thinkingLevel } = parseGeminiModelSpec(
+          modelName && (modelName.startsWith('gemini-') || modelName === '__builtin_auto_ensemble__')
             ? modelName
-            : 'gemini-4-hydrogen';
-        actualProviderName = '内置 Gemini';
-        actualModelUsed = geminiModel;
+            : 'gemini-4-hydrogen'
+        );
+        actualProviderName = '原生态 Google Gemini';
+        actualModelUsed = baseModel;
 
         const response = await ai.models.generateContent({
-          model: geminiModel,
+          model: baseModel,
           contents: JSON.stringify({
             song: trackTitle,
             artist: artistName,
@@ -758,7 +732,7 @@ Guidelines:
             lines: translatable,
           }),
           config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
+            ...(thinkingLevel ? { thinkingConfig: { thinkingLevel } } : {}),
             systemInstruction: `You are an acclaimed literary song lyricist and poetic translator.
 Translate the given song lyrics line by line into ${langInstruction}.
 Translation style requirement: ${styleInstruction}

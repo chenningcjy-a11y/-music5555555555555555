@@ -10,6 +10,8 @@ const CACHE_DIR = path.resolve(__dirname, '../../.cache');
 const VAULT_FILE = path.join(CACHE_DIR, 'ai-providers-vault.enc');
 const KEY_FILE = path.join(CACHE_DIR, '.vault-key');
 
+export const BUILTIN_GEMINI_PROVIDER_ID = '__builtin_gemini__';
+
 export type AiProviderKind =
   | 'deepseek'
   | 'openai'
@@ -369,8 +371,15 @@ export async function getStoredProviderWithKey(providerId?: string): Promise<{
   const vault = await loadVault();
   let found: StoredAiProvider | null = null;
   if (providerId) {
+    if (providerId === BUILTIN_GEMINI_PROVIDER_ID) return null;
     found = vault.providers.find((p) => p.id === providerId) || null;
   } else {
+    if (
+      vault.defaultProviderId === BUILTIN_GEMINI_PROVIDER_ID &&
+      process.env.GEMINI_API_KEY
+    ) {
+      return null;
+    }
     const def = vault.defaultProviderId
       ? vault.providers.find((p) => p.id === vault.defaultProviderId) || null
       : null;
@@ -512,6 +521,12 @@ export async function deleteProvider(providerId: string): Promise<boolean> {
 
 export async function setDefaultProvider(providerId: string): Promise<boolean> {
   const vault = await loadVault();
+  if (providerId === BUILTIN_GEMINI_PROVIDER_ID) {
+    if (!process.env.GEMINI_API_KEY) return false;
+    vault.defaultProviderId = providerId;
+    await persistVault(vault);
+    return true;
+  }
   if (!vault.providers.some((p) => p.id === providerId)) return false;
   vault.defaultProviderId = providerId;
   await persistVault(vault);

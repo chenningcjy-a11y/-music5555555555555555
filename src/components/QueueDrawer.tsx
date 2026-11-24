@@ -1,4 +1,5 @@
 import React from 'react';
+import { createPortal } from 'react-dom';
 import { ListMusic, Play, Trash2, X } from 'lucide-react';
 import { useMusic } from '../context/MusicContext';
 import { formatTime } from '../utils/constants';
@@ -30,7 +31,7 @@ export const QueueDrawer: React.FC = () => {
     shufflePlayedSet.has(t.id)
   ).length;
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-50 flex justify-end">
       <div
         onClick={() => setIsQueueOpen(false)}
@@ -146,6 +147,7 @@ export const QueueDrawer: React.FC = () => {
           )}
         </div>
       </aside>
-    </div>
+    </div>,
+    document.body
   );
 };

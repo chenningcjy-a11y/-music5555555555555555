@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Activity,
   AlertCircle,
@@ -673,12 +674,13 @@ export const MvTheaterAiAssistantCard: React.FC<MvTheaterAiAssistantCardProps> =
       )}
 
       {/* Quick Custom API Key Modal */}
-      {showCustomModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-md">
-          <form
-            onSubmit={handleSaveCustomApiKey}
-            className="w-full max-w-md rounded-3xl bg-[#190712] border border-white/20 p-6 space-y-4 shadow-2xl"
-          >
+      {showCustomModal &&
+        createPortal(
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-md overflow-y-auto">
+            <form
+              onSubmit={handleSaveCustomApiKey}
+              className="w-full max-w-lg rounded-3xl bg-[#190712] border border-white/20 p-6 space-y-4 shadow-2xl"
+            >
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold text-white flex items-center gap-2">
                 <Sparkles className="w-4 h-4 text-rose-400" />
@@ -766,8 +768,9 @@ export const MvTheaterAiAssistantCard: React.FC<MvTheaterAiAssistantCardProps> =
               </button>
             </div>
           </form>
-        </div>
-      )}
+        </div>,
+          document.body
+        )}
 
       {analyzing && stageText && (
         <div className="rounded-2xl bg-black/35 border border-white/10 px-3.5 py-2.5 flex items-center gap-2.5 text-xs text-white/85">

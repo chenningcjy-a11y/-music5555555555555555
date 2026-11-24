@@ -117,7 +117,7 @@ export function validateProviderForTask(
       error: `服务商「${provider.name}」当前未启用，请在 API 服务管理中开启。`,
     };
   }
-  if (!provider.hasKey) {
+  if (!provider.hasKey && !provider.isBuiltin && provider.id !== '__builtin_gemini__') {
     return {
       ok: false,
       error: `服务商「${provider.name}」尚未填写 API Key。`,

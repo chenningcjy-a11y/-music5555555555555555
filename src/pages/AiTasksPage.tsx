@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   Clock,
   Disc3,
+  Download,
   ExternalLink,
   Info,
   ListChecks,
@@ -26,6 +27,7 @@ type TaskFilterTab = 'all' | 'active' | 'completed' | 'failed';
 
 const CATEGORY_LABELS: Record<AiTaskCategory, string> = {
   stem_separation: '人声与伴奏分离',
+  mv_export: 'MV 与舞台视频导出',
   audio_analysis: 'AI 歌曲分析',
   lyrics_assistant: 'AI 歌词处理',
   dsp_tuning: 'AI 智能调音',
@@ -78,6 +80,7 @@ export const AiTasksPage: React.FC = () => {
     completedCount,
     failedCount,
     enqueueStemSeparationTask,
+    downloadMvExportResult,
     pauseTask,
     resumeTask,
     cancelTask,
@@ -171,7 +174,7 @@ export const AiTasksPage: React.FC = () => {
               AI 任务中心
             </h1>
             <p className="text-xs sm:text-sm text-white/60 mt-1">
-              所有 AI 音源分离、歌曲分析、歌词与调音任务均以独立 Task ID 后台队列执行，切换播放歌曲或页面绝不影响任务归属与进度
+              所有音源分离、MV 舞台视频合成导出与 AI 处理任务均以独立 Task ID 后台队列执行；切歌、切页不会打断，MV 导出定时保存编码断点，页面意外中断后也可继续
             </p>
           </div>
         </div>
@@ -219,12 +222,12 @@ export const AiTasksPage: React.FC = () => {
         </div>
       </div>
 
-      {/* Explicit Browser Local Worker Limitation Banner */}
+      {/* Explicit Browser Local Worker / MV Export Limitation Banner */}
       {hasLocalBackgroundTask && (
         <div className="rounded-2xl bg-amber-500/12 border border-amber-400/25 px-4 py-3 flex items-start gap-2.5 text-xs text-amber-100">
           <Info className="w-4 h-4 text-amber-300 shrink-0 mt-0.5" />
           <p className="leading-relaxed">
-            检测到浏览器本地推理任务正在运行：请保持当前标签页开启，切勿刷新或关闭页面；切换正在播放的歌曲或切换到其他应用页面不会中断任务。如需关闭标签页后仍持续运行，请在「音质与音效」切换至服务端 ONNX 引擎。
+            检测到本地后台任务（音源分离或 MV 导出）正在运行：请尽量保持当前标签页开启，切歌或切换其他应用页面不会中断任务。MV 导出任务每隔数秒会自动保存编码断点，即使页面意外刷新或关闭，重新打开页面后仍可在任务中心点击「继续导出」恢复进度。
           </p>
         </div>
       )}
@@ -292,7 +295,7 @@ export const AiTasksPage: React.FC = () => {
             {filterTab === 'all' ? '暂无 AI 后台任务记录' : '当前筛选分类下暂无任务'}
           </p>
           <p className="text-xs text-white/50 max-w-lg mx-auto leading-relaxed">
-            您可以在上方选择任意曲库歌曲点击「创建分离任务」，或在「音质与音效」及「AI 智能中心」发起音源分离、歌词翻译与音乐分析。
+            您可以在上方选择任意曲库歌曲点击「创建分离任务」，或在播放页点击导出 MV 与歌曲文件夹，也可在「音质与音效」及「AI 智能中心」发起音乐分析与歌词翻译。
           </p>
         </section>
       ) : (
@@ -304,6 +307,8 @@ export const AiTasksPage: React.FC = () => {
             const createdStr = new Date(
               task.createdAt || task.startedAt
             ).toLocaleString('zh-CN', { hour12: false });
+            const canResumeMvInterrupted =
+              task.category === 'mv_export' && task.status === 'interrupted';
 
             return (
               <article
@@ -366,7 +371,8 @@ export const AiTasksPage: React.FC = () => {
 
                   {/* Card Actions */}
                   <div className="flex flex-wrap items-center gap-2 shrink-0">
-                    {task.category === 'stem_separation' &&
+                    {(task.category === 'stem_separation' ||
+                      task.category === 'mv_export') &&
                       (task.status === 'running' || task.status === 'queued') && (
                         <button
                           type="button"
@@ -378,7 +384,7 @@ export const AiTasksPage: React.FC = () => {
                         </button>
                       )}
 
-                    {task.status === 'paused' && (
+                    {(task.status === 'paused' || canResumeMvInterrupted) && (
                       <button
                         type="button"
                         onClick={() => void resumeTask(task.id)}
@@ -388,7 +394,9 @@ export const AiTasksPage: React.FC = () => {
                         }}
                       >
                         <Play className="w-3.5 h-3.5" fill="currentColor" />
-                        <span>继续</span>
+                        <span>
+                          {task.category === 'mv_export' ? '继续导出' : '继续'}
+                        </span>
                       </button>
                     )}
 
@@ -412,31 +420,56 @@ export const AiTasksPage: React.FC = () => {
                       <button
                         type="button"
                         onClick={() => void retryTask(task.id)}
-                        className="min-h-[38px] px-3.5 py-1.5 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
-                        style={{
-                          background: `linear-gradient(135deg, ${activePalette.primary}, ${activePalette.secondary})`,
-                        }}
+                        className={
+                          canResumeMvInterrupted
+                            ? 'min-h-[38px] px-3 py-1.5 rounded-xl bg-white/10 hover:bg-white/16 border border-white/12 text-xs font-medium text-white flex items-center gap-1.5 cursor-pointer whitespace-nowrap'
+                            : 'min-h-[38px] px-3.5 py-1.5 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer whitespace-nowrap'
+                        }
+                        style={
+                          canResumeMvInterrupted
+                            ? undefined
+                            : {
+                                background: `linear-gradient(135deg, ${activePalette.primary}, ${activePalette.secondary})`,
+                              }
+                        }
                       >
                         <RotateCcw className="w-3.5 h-3.5" />
                         <span>
-                          {task.status === 'needs_resubmit' ? '重新提交' : '重试'}
+                          {task.category === 'mv_export'
+                            ? '重新导出'
+                            : task.status === 'needs_resubmit'
+                            ? '重新提交'
+                            : '重试'}
                         </span>
                       </button>
                     )}
 
-                    {task.status === 'completed' && (
-                      <button
-                        type="button"
-                        onClick={() => setSelectedTaskId(task.id)}
-                        className="min-h-[38px] px-3.5 py-1.5 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
-                        style={{
-                          background: `linear-gradient(135deg, ${activePalette.primary}, ${activePalette.secondary})`,
-                        }}
-                      >
-                        <ExternalLink className="w-3.5 h-3.5" />
-                        <span>查看结果</span>
-                      </button>
-                    )}
+                    {task.status === 'completed' &&
+                      (task.category === 'mv_export' ? (
+                        <button
+                          type="button"
+                          onClick={() => void downloadMvExportResult(task.id)}
+                          className="min-h-[38px] px-3.5 py-1.5 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                          style={{
+                            background: `linear-gradient(135deg, ${activePalette.primary}, ${activePalette.secondary})`,
+                          }}
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>下载文件</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setSelectedTaskId(task.id)}
+                          className="min-h-[38px] px-3.5 py-1.5 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                          style={{
+                            background: `linear-gradient(135deg, ${activePalette.primary}, ${activePalette.secondary})`,
+                          }}
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" />
+                          <span>查看结果</span>
+                        </button>
+                      ))}
 
                     <button
                       type="button"

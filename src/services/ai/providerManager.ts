@@ -7,19 +7,23 @@ import {
   StemServiceKind,
 } from '../../types/ai';
 
+export const BUILTIN_GEMINI_PROVIDER_ID = '__builtin_gemini__';
+
 export function inferClientModelCapabilities(
   kind: AiProviderKind,
   modelId: string
 ): ModelCapabilities {
   const m = (modelId || '').toLowerCase();
   if (kind === 'gemini') {
+    const isEnsemble = m === '__builtin_auto_ensemble__';
     const isTextOrMultimodal =
       !m.includes('embedding') && !m.includes('tts') && !m.includes('image');
     return {
-      textReasoning: isTextOrMultimodal,
-      lyricsProcessing: isTextOrMultimodal,
-      dspPlanning: isTextOrMultimodal,
+      textReasoning: isTextOrMultimodal || isEnsemble,
+      lyricsProcessing: isTextOrMultimodal || isEnsemble,
+      dspPlanning: isTextOrMultimodal || isEnsemble,
       audioInputAnalysis:
+        isEnsemble ||
         m.includes('gemini-4') ||
         m.includes('gemini-3') ||
         m.includes('gemini-2.5') ||

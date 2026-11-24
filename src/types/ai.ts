@@ -1,4 +1,9 @@
-import { AudioDspSettings } from './music';
+import {
+  AnimationIntensity,
+  AudioDspSettings,
+  MvMidBreakRange,
+  MvTheaterPhase,
+} from './music';
 
 export type AiSubTab = 'assistant' | 'toolbox' | 'providers' | 'history';
 
@@ -35,6 +40,7 @@ export interface AiProviderConfig {
   availableModels: string[];
   maskedKey: string;
   hasKey: boolean;
+  isBuiltin?: boolean;
   enabled: boolean;
   isDefault: boolean;
   timeoutMs: number;
@@ -69,6 +75,7 @@ export interface StemServiceConfig {
 
 export type AiTaskCategory =
   | 'stem_separation'
+  | 'mv_export'
   | 'lyrics_assistant'
   | 'audio_analysis'
   | 'dsp_tuning'
@@ -86,6 +93,143 @@ export type AiTaskStatus =
   | 'interrupted'
   | 'needs_resubmit'
   | 'error';
+
+export type MvExportDeliveryMode = 'zip-folder' | 'local-dir' | 'video-only';
+
+export type MvExportQuality = '720p' | '1080p' | '1440p' | '2160p';
+
+export interface MvExportTaskConfig {
+  trackId: string;
+  mvId?: string | null;
+  deliveryMode: MvExportDeliveryMode;
+  quality: MvExportQuality;
+  fps: number;
+  durationMode: 'full' | 'custom';
+  startOffsetSec: number;
+  clipDurationSec: number | null;
+  includeMvInVideo: boolean;
+  includeMvIntro: boolean;
+  includeMvMidBreaks: boolean;
+  includeMvOutro: boolean;
+  showBilingual: boolean;
+  showWordSync: boolean;
+  fontPreset?: string;
+  animationIntensity: AnimationIntensity;
+  mvUiFadeInSec?: number;
+  mvUiFadeOutSec?: number;
+}
+
+export interface MvExportResultMeta {
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  durationSec: number;
+  width: number;
+  height: number;
+  fps: number;
+  deliveryMode: MvExportDeliveryMode;
+  manifestPaths?: Array<{ path: string; sizeText: string }>;
+  savedToLocalFolderName?: string;
+  createdAt: number;
+}
+
+export interface MvExportCheckpointMeta {
+  taskId: string;
+  engineKind: 'webcodecs-mp4' | 'webcodecs-webm';
+  codecSupport: {
+    container: 'mp4' | 'webm';
+    videoCodec: string;
+    audioCodec: string;
+    bitrate: number;
+    audioBitrate: number;
+    hardwareAcceleration: 'no-preference' | 'prefer-hardware' | 'prefer-software';
+    latencyMode?: 'quality' | 'realtime';
+    bitrateMode?: 'constant' | 'variable' | 'quantizer';
+  };
+  width: number;
+  height: number;
+  fps: number;
+  songDuration: number;
+  mvDuration: number;
+  targetDuration: number;
+  totalFrames: number;
+  safeStart: number;
+  hasIntro: boolean;
+  includeMvIntro: boolean;
+  includeMvMidBreaks: boolean;
+  includeMvOutro: boolean;
+  hasMvVideo: boolean;
+  nextFrameIdx: number;
+  phase: MvTheaterPhase;
+  mvPhaseTime: number;
+  curAudioTime: number;
+  completedBreakIds: string[];
+  activeMidBreak: MvMidBreakRange | null;
+  outroStartMvSec: number;
+  songSampleCursor: number;
+  mvSampleCursor: number;
+  lastEmittedVideoDtsUs: number;
+  reorderShiftUs: number;
+  totalAudioSamplesEncoded: number;
+  emittedAudioEndUs: number;
+  lastEmittedAudioTsUs: number;
+  rewindAudioL: ArrayBuffer;
+  rewindAudioR: ArrayBuffer;
+  rewindAudioCount: number;
+  drawState: {
+    smoothBass: number;
+    smoothMid: number;
+    smoothVol: number;
+    activeIdx: number;
+    prevIdx: number;
+    lineTransitionElapsedSec: number;
+    stepDirection: 'forward' | 'backward' | 'none';
+  };
+  videoDecoderConfig?: {
+    codec: string;
+    codedWidth?: number;
+    codedHeight?: number;
+    displayAspectWidth?: number;
+    displayAspectHeight?: number;
+    description?: ArrayBuffer;
+  };
+  audioDecoderConfig?: {
+    codec: string;
+    numberOfChannels: number;
+    sampleRate: number;
+    description?: ArrayBuffer;
+  };
+  chunkBatchCount: number;
+  updatedAt: number;
+}
+
+export interface MvExportChunkBatch {
+  id: string;
+  taskId: string;
+  batchIndex: number;
+  videoChunks: Array<{
+    data: ArrayBuffer;
+    type: 'key' | 'delta';
+    timestamp: number;
+    duration: number;
+    cts: number;
+  }>;
+  audioChunks: Array<{
+    data: ArrayBuffer;
+    type: 'key' | 'delta';
+    timestamp: number;
+    duration: number;
+  }>;
+}
+
+export interface MvExportResultRecord {
+  taskId: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  blob: Blob;
+  createdAt: number;
+}
 
 export interface AiTaskSourceFileInfo {
   format: string;
@@ -147,6 +291,9 @@ export interface AiTaskRecord {
     vocalSizeBytes: number;
     instrumentalSizeBytes: number;
   };
+  mvExportConfig?: MvExportTaskConfig;
+  mvExportResult?: MvExportResultMeta;
+  hasResumableCheckpoint?: boolean;
   errorMessage?: string;
   replayPayload?: {
     prompt?: string;

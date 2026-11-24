@@ -448,6 +448,25 @@ export async function translateLyricsToBilingual(
   providerName?: string;
   modelUsed?: string;
 }> {
+  let effectiveProviderId = providerId;
+  let effectiveModelName = modelName;
+  if (!effectiveProviderId && typeof window !== 'undefined') {
+    try {
+      const saved = window.localStorage.getItem('lumina_ai_selection');
+      if (saved) {
+        const parsed = JSON.parse(saved) as { providerId?: string; model?: string };
+        if (parsed.providerId) {
+          effectiveProviderId = parsed.providerId;
+          if (!effectiveModelName && parsed.model) {
+            effectiveModelName = parsed.model;
+          }
+        }
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }
+
   const res = await fetch('/api/lyrics/translate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -457,8 +476,8 @@ export async function translateLyricsToBilingual(
       artistName,
       targetLanguage,
       style,
-      providerId,
-      modelName,
+      providerId: effectiveProviderId,
+      modelName: effectiveModelName,
     }),
   });
 

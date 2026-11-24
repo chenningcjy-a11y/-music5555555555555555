@@ -394,8 +394,9 @@ export const AiAssistantTab: React.FC<AiAssistantTabProps> = ({
             >
               {providers.map((p) => (
                 <option key={p.id} value={p.id} className="bg-[#180713]">
-                  {p.name}
-                  {p.hasKey ? '' : '（未填密钥）'}
+                  {p.id === '__builtin_gemini__'
+                    ? p.name
+                    : `${p.name}${p.hasKey ? '' : '（未填密钥）'}`}
                 </option>
               ))}
             </select>
@@ -553,16 +554,12 @@ export const AiAssistantTab: React.FC<AiAssistantTabProps> = ({
             欢迎使用 LUMINA AI 智能调度助手
           </p>
           <p className="text-xs text-white/50 max-w-xl mx-auto leading-relaxed">
-            支持通过 DeepSeek / OpenAI / Gemini 等模型规划调音参数、处理歌词与识别需求，并严格校验模型能力与独立音源分离服务状态后再执行操作。
+            默认支持内置原生态 Google Gemini（免填密钥即用），也可随时切换 DeepSeek / OpenAI / 您的个人 Gemini API 密钥，规划调音参数、处理歌词与分析音乐，并校验独立音源分离服务状态。
           </p>
         </section>
       ) : (
         <div className="space-y-4">
           {turns.map((turn) => {
-            const capNote = inferClientModelCapabilities(
-              activeProvider?.kind || 'deepseek',
-              turn.modelName
-            );
             return (
               <section
                 key={turn.id}
@@ -698,7 +695,7 @@ export const AiAssistantTab: React.FC<AiAssistantTabProps> = ({
                     </pre>
                     {turn.dspPlan.suggestStemSeparation && !currentTrackStemMeta && (
                       <p className="text-amber-200/90">
-                        说明：{capNote.note ? '为避免 EQ 影响人声/伴奏干净度，建议执行 AI 音源分离后单独调节双轨增益。' : ''}
+                        说明：为避免 EQ 影响人声/伴奏干净度，建议先执行 AI 音源分离后单独调节双轨增益。
                       </p>
                     )}
                     <div className="flex flex-wrap gap-2.5">

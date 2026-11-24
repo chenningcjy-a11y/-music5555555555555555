@@ -12,7 +12,7 @@ import {
   Trash2,
   Wrench,
 } from 'lucide-react';
-import { useAi } from '../../context/AiContext';
+import { BUILTIN_GEMINI_PROVIDER_ID, useAi } from '../../context/AiContext';
 import { useMusic } from '../../context/MusicContext';
 import {
   deleteProviderById,
@@ -81,12 +81,25 @@ const PROVIDER_TEMPLATES: {
 export const AiProvidersTab: React.FC = () => {
   const {
     providers,
+    builtinGeminiAvailable,
     refreshProviders,
     stemServices,
     refreshStemServices,
     setSelectedProviderId,
   } = useAi();
   const { showToast, activePalette } = useMusic();
+
+  const builtinProvider =
+    providers.find((p) => p.id === BUILTIN_GEMINI_PROVIDER_ID) || null;
+  const userProviders = providers.filter(
+    (p) => p.id !== BUILTIN_GEMINI_PROVIDER_ID
+  );
+
+  const [isTestingBuiltin, setIsTestingBuiltin] = useState(false);
+  const [builtinTestBanner, setBuiltinTestBanner] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
 
   const [editingId, setEditingId] = useState<string>('');
   const [name, setName] = useState('');
@@ -141,13 +154,13 @@ export const AiProvidersTab: React.FC = () => {
   };
 
   useEffect(() => {
-    if (!editingId && providers.length > 0) {
-      const def = providers.find((p) => p.isDefault) || providers[0];
+    if (!editingId && userProviders.length > 0) {
+      const def = userProviders.find((p) => p.isDefault) || userProviders[0];
       loadProviderIntoForm(def);
     } else if (editingId) {
-      const current = providers.find((p) => p.id === editingId);
-      if (!current && providers.length > 0) {
-        loadProviderIntoForm(providers[0]);
+      const current = userProviders.find((p) => p.id === editingId);
+      if (!current && userProviders.length > 0) {
+        loadProviderIntoForm(userProviders[0]);
       }
     }
   }, [providers, editingId]);
@@ -171,7 +184,8 @@ export const AiProvidersTab: React.FC = () => {
     }
   }, [stemServices, editingStemId]);
 
-  const currentEditingProvider = providers.find((p) => p.id === editingId) || null;
+  const currentEditingProvider =
+    userProviders.find((p) => p.id === editingId) || null;
   const currentEditingStem = stemServices.find((s) => s.id === editingStemId) || null;
   const currentCapabilities = inferClientModelCapabilities(kind, model);
 
@@ -382,15 +396,116 @@ export const AiProvidersTab: React.FC = () => {
         </div>
       </div>
 
-      {/* Section 1: LLM / Multimodal AI Provider Manager */}
+      {/* Builtin Native Google Gemini Card (Zero API Key Required) */}
+      <section className="rounded-3xl bg-sky-500/10 backdrop-blur-xl border border-sky-400/25 p-5 sm:p-6 space-y-3.5">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-base sm:text-lg font-semibold text-white">
+                原生态 Google Gemini（内置免个人密钥通道）
+              </h2>
+              <span
+                className={`px-2 py-0.5 rounded-lg text-[11px] font-medium border ${
+                  builtinGeminiAvailable
+                    ? 'bg-emerald-500/15 border-emerald-400/30 text-emerald-200'
+                    : 'bg-white/8 border-white/15 text-white/60'
+                }`}
+              >
+                {builtinGeminiAvailable ? '已就绪 · 无需配置 Key' : '当前环境未启用'}
+              </span>
+              {builtinProvider?.isDefault && (
+                <span
+                  className="px-2 py-0.5 rounded-lg text-[11px] font-semibold bg-white/12 border border-white/20 text-white"
+                  style={{ color: activePalette.primary }}
+                >
+                  当前默认 AI 引擎
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-white/65 leading-relaxed">
+              系统原生接入 Gemini 4 Hydrogen / Gemini 3.1 Flash Lite / Gemini 4 Argon 多模态与深度思考模型，支持智能助手、歌词诗意翻译、DSP 调音规划、真实音频分析与 MV 剧情分段复核，随时可直接与您的个人 API Key 自由切换。
+            </p>
+          </div>
+
+          {builtinGeminiAvailable && (
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                disabled={isTestingBuiltin}
+                onClick={async () => {
+                  setIsTestingBuiltin(true);
+                  setBuiltinTestBanner(null);
+                  try {
+                    const res = await testProviderApi(BUILTIN_GEMINI_PROVIDER_ID);
+                    setBuiltinTestBanner({
+                      ok: res.ok,
+                      text: res.ok
+                        ? `原生态 Google Gemini 连通正常（延迟 ${res.latencyMs}ms，${res.modelsFound || 0} 个模型档位可用）`
+                        : res.error || '内置通道暂未连通',
+                    });
+                  } catch (err) {
+                    setBuiltinTestBanner({
+                      ok: false,
+                      text: err instanceof Error ? err.message : '测试失败',
+                    });
+                  } finally {
+                    setIsTestingBuiltin(false);
+                  }
+                }}
+                className="min-h-[38px] px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/16 border border-white/15 text-xs font-medium text-white flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                {isTestingBuiltin ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+                <span>测试内置连接</span>
+              </button>
+
+              {!builtinProvider?.isDefault && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await setDefaultProviderById(BUILTIN_GEMINI_PROVIDER_ID);
+                    setSelectedProviderId(BUILTIN_GEMINI_PROVIDER_ID);
+                    await refreshProviders();
+                    showToast('已将「原生态 Google Gemini」设为默认 AI 引擎');
+                  }}
+                  className="min-h-[38px] px-4 py-2 rounded-xl text-xs font-semibold text-white cursor-pointer"
+                  style={{
+                    background: `linear-gradient(135deg, ${activePalette.primary}, ${activePalette.secondary})`,
+                  }}
+                >
+                  设为默认引擎
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+
+        {builtinTestBanner && (
+          <div
+            className={`rounded-xl px-3.5 py-2 text-xs flex items-center gap-2 border ${
+              builtinTestBanner.ok
+                ? 'bg-emerald-500/12 border-emerald-400/30 text-emerald-100'
+                : 'bg-rose-500/12 border-rose-400/30 text-rose-100'
+            }`}
+          >
+            {builtinTestBanner.ok ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-300 shrink-0" />
+            ) : (
+              <AlertCircle className="w-4 h-4 text-rose-300 shrink-0" />
+            )}
+            <span>{builtinTestBanner.text}</span>
+          </div>
+        )}
+      </section>
+
+      {/* Section 1: User Custom / Third-Party AI API Provider Manager */}
       <section className="rounded-3xl bg-white/[0.045] backdrop-blur-xl border border-white/10 p-5 sm:p-6 space-y-5">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <h2 className="text-base sm:text-lg font-semibold text-white">
-              第三方 AI API 服务管理
+              个人 / 第三方 AI API 密钥管理
             </h2>
             <p className="text-xs text-white/55 mt-0.5">
-              支持 DeepSeek、OpenAI、Google Gemini、OpenAI 兼容接口及自定义 API 服务
+              支持 DeepSeek、OpenAI、您的个人 Google Gemini Key、OpenAI 兼容接口及自定义 API 服务
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
@@ -409,9 +524,9 @@ export const AiProvidersTab: React.FC = () => {
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-          {/* Left list of configured providers */}
+          {/* Left list of configured user providers */}
           <div className="lg:col-span-5 space-y-2.5">
-            {providers.map((p) => {
+            {userProviders.map((p) => {
               const selected = p.id === editingId;
               return (
                 <div
@@ -759,7 +874,7 @@ export const AiProvidersTab: React.FC = () => {
                 </button>
               )}
 
-              {editingId && providers.length > 1 && (
+              {editingId && userProviders.length > 1 && (
                 <button
                   type="button"
                   onClick={handleDeleteProvider}

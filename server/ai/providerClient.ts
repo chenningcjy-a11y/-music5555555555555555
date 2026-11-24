@@ -1,11 +1,153 @@
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import {
   type AiProviderKind,
+  BUILTIN_GEMINI_PROVIDER_ID,
   checkAndIncrementProviderQuota,
   getStoredProviderWithKey,
+  listPublicProviders,
   recordProviderProbeResult,
   type StoredAiProvider,
 } from './keyVault.ts';
+
+export const BUILTIN_GEMINI_MODEL_IDS = [
+  '__builtin_auto_ensemble__',
+  'gemini-4-hydrogen',
+  'gemini-3.1-flash-lite',
+  'gemini-4-argon',
+  'gemini-3.1-flash-lite::minimal',
+  'gemini-3.1-flash-lite::medium',
+  'gemini-3.1-flash-lite::high',
+  'gemini-4-hydrogen::low',
+  'gemini-4-hydrogen::medium',
+  'gemini-4-hydrogen::high',
+  'gemini-4-hydrogen::xhigh',
+];
+
+export function buildVirtualBuiltinGeminiProvider(): StoredAiProvider {
+  const now = Date.now();
+  return {
+    id: BUILTIN_GEMINI_PROVIDER_ID,
+    name: '原生态 Google Gemini（内置免密钥）',
+    kind: 'gemini',
+    baseUrl: 'https://generativelanguage.googleapis.com',
+    model: 'gemini-4-hydrogen',
+    availableModels: BUILTIN_GEMINI_MODEL_IDS,
+    maskedKey: '内置原生态服务',
+    hasKey: Boolean(process.env.GEMINI_API_KEY),
+    enabled: Boolean(process.env.GEMINI_API_KEY),
+    timeoutMs: 60000,
+    maxRequestsPerDay: 0,
+    requestsToday: 0,
+    requestsDate: new Date().toISOString().slice(0, 10),
+    connectionStatus: process.env.GEMINI_API_KEY ? 'connected' : 'untested',
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+export function parseGeminiModelSpec(rawModel: string): {
+  baseModel: string;
+  thinkingLevel?: ThinkingLevel;
+} {
+  const trimmed = (rawModel || '').trim();
+  if (!trimmed || trimmed === '__builtin_auto_ensemble__') {
+    return { baseModel: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.MEDIUM };
+  }
+  const [rawBase, rawTier] = trimmed.split('::');
+  const baseModel = (rawBase || 'gemini-4-hydrogen').trim();
+  if (rawTier) {
+    const tier = rawTier.trim().toLowerCase();
+    if (tier === 'minimal') return { baseModel, thinkingLevel: ThinkingLevel.MINIMAL };
+    if (tier === 'low') return { baseModel, thinkingLevel: ThinkingLevel.LOW };
+    if (tier === 'medium') return { baseModel, thinkingLevel: ThinkingLevel.MEDIUM };
+    if (tier === 'high') return { baseModel, thinkingLevel: ThinkingLevel.HIGH };
+    if (tier === 'xhigh') return { baseModel, thinkingLevel: ThinkingLevel.XHIGH };
+  }
+  if (baseModel.startsWith('gemini-4') || baseModel.startsWith('gemini-3')) {
+    return { baseModel, thinkingLevel: ThinkingLevel.LOW };
+  }
+  return { baseModel };
+}
+
+export async function resolveEffectiveProviderWithKey(
+  providerId?: string
+): Promise<
+  | { ok: true; provider: StoredAiProvider; apiKey: string; isBuiltin: boolean }
+  | { ok: false; error: string }
+> {
+  const trimmedId = typeof providerId === 'string' ? providerId.trim() : '';
+  const hasBuiltinKey = Boolean(process.env.GEMINI_API_KEY?.trim());
+
+  if (trimmedId === BUILTIN_GEMINI_PROVIDER_ID) {
+    if (!hasBuiltinKey) {
+      return {
+        ok: false,
+        error: '当前运行环境未配置内置原生态 Google Gemini 服务密钥，请在「API 服务管理」配置您自己的 API Key。',
+      };
+    }
+    return {
+      ok: true,
+      provider: buildVirtualBuiltinGeminiProvider(),
+      apiKey: process.env.GEMINI_API_KEY!.trim(),
+      isBuiltin: true,
+    };
+  }
+
+  if (trimmedId) {
+    const explicit = await getStoredProviderWithKey(trimmedId);
+    if (!explicit) {
+      return { ok: false, error: `未找到所选 AI 服务商 (${trimmedId})` };
+    }
+    if (!explicit.provider.enabled) {
+      return {
+        ok: false,
+        error: `所选 AI 服务商「${explicit.provider.name}」当前处于禁用状态，请先在「API 服务管理」启用。`,
+      };
+    }
+    if (!explicit.apiKey) {
+      return {
+        ok: false,
+        error: `所选 AI 服务商「${explicit.provider.name}」尚未配置 API Key，请前往「API 服务管理」填写您的密钥，或切换为「原生态 Google Gemini」。`,
+      };
+    }
+    return { ok: true, provider: explicit.provider, apiKey: explicit.apiKey, isBuiltin: false };
+  }
+
+  // No explicit providerId: honour explicit built-in default if chosen, else ready user provider, else automatic native Gemini fallback
+  const publicMeta = await listPublicProviders();
+  if (publicMeta.defaultProviderId === BUILTIN_GEMINI_PROVIDER_ID && hasBuiltinKey) {
+    return {
+      ok: true,
+      provider: buildVirtualBuiltinGeminiProvider(),
+      apiKey: process.env.GEMINI_API_KEY!.trim(),
+      isBuiltin: true,
+    };
+  }
+
+  const autoUser = await getStoredProviderWithKey(undefined);
+  if (autoUser && autoUser.provider.enabled && autoUser.apiKey) {
+    return {
+      ok: true,
+      provider: autoUser.provider,
+      apiKey: autoUser.apiKey,
+      isBuiltin: false,
+    };
+  }
+
+  if (hasBuiltinKey) {
+    return {
+      ok: true,
+      provider: buildVirtualBuiltinGeminiProvider(),
+      apiKey: process.env.GEMINI_API_KEY!.trim(),
+      isBuiltin: true,
+    };
+  }
+
+  return {
+    ok: false,
+    error: '尚未配置可用 AI 服务商或 API Key，请前往「AI 智能中心 → API 服务管理」配置服务商密钥。',
+  };
+}
 
 export interface ModelCapabilities {
   textReasoning: boolean;
@@ -160,6 +302,20 @@ export async function fetchModelsFromProvider(
   supportsModelListing: boolean;
   message?: string;
 }> {
+  if (providerId === BUILTIN_GEMINI_PROVIDER_ID) {
+    if (!process.env.GEMINI_API_KEY?.trim()) {
+      throw new Error('当前环境未启用内置原生态 Google Gemini 密钥');
+    }
+    return {
+      models: BUILTIN_GEMINI_MODEL_IDS.map((id) => ({
+        id,
+        label: id,
+        capabilities: inferModelCapabilities('gemini', parseGeminiModelSpec(id).baseModel),
+      })),
+      supportsModelListing: true,
+    };
+  }
+
   const resolved = await getStoredProviderWithKey(providerId);
   if (!resolved) {
     throw new Error('未找到对应的 AI 服务商配置');
@@ -300,6 +456,41 @@ export async function testProviderConnection(providerId: string): Promise<{
   error?: string;
   modelsFound?: number;
 }> {
+  if (providerId === BUILTIN_GEMINI_PROVIDER_ID) {
+    const apiKey = process.env.GEMINI_API_KEY?.trim();
+    if (!apiKey) {
+      return {
+        ok: false,
+        latencyMs: 0,
+        error: '当前运行环境未配置内置原生态 Google Gemini 密钥',
+      };
+    }
+    const startedAt = Date.now();
+    try {
+      const text = await callProviderTextCompletion({
+        provider: buildVirtualBuiltinGeminiProvider(),
+        apiKey,
+        modelOverride: 'gemini-3.1-flash-lite::minimal',
+        systemInstruction: 'Reply strictly with OK.',
+        userPrompt: 'ping',
+        expectJson: false,
+      });
+      const latencyMs = Date.now() - startedAt;
+      if (!text) throw new Error('Gemini 响应为空');
+      return {
+        ok: true,
+        latencyMs,
+        modelsFound: BUILTIN_GEMINI_MODEL_IDS.length,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        latencyMs: Date.now() - startedAt,
+        error: sanitizeErrorMessage(err),
+      };
+    }
+  }
+
   const resolved = await getStoredProviderWithKey(providerId);
   if (!resolved) {
     return { ok: false, latencyMs: 0, error: '未找到服务商配置' };
@@ -399,9 +590,11 @@ export async function callProviderTextCompletion(params: {
     throw new Error(`服务商「${provider.name}」尚未配置 API Key`);
   }
 
-  const quota = await checkAndIncrementProviderQuota(provider.id);
-  if (!quota.allowed) {
-    throw new Error(quota.error || '超出每日请求限制');
+  if (provider.id !== BUILTIN_GEMINI_PROVIDER_ID) {
+    const quota = await checkAndIncrementProviderQuota(provider.id);
+    if (!quota.allowed) {
+      throw new Error(quota.error || '超出每日请求限制');
+    }
   }
 
   const { signal, cleanup } = buildTimeoutSignal(provider.timeoutMs, externalSignal);
@@ -442,18 +635,15 @@ export async function callProviderTextCompletion(params: {
       }
       parts.push({ text: userPrompt });
 
-      const useThinking =
-        model.startsWith('gemini-4') || model.startsWith('gemini-3');
+      const { baseModel, thinkingLevel } = parseGeminiModelSpec(model);
 
       const response = await ai.models.generateContent({
-        model,
+        model: baseModel,
         contents: { parts },
         config: {
           systemInstruction,
           ...(expectJson ? { responseMimeType: 'application/json' } : {}),
-          ...(useThinking
-            ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-            : {}),
+          ...(thinkingLevel ? { thinkingConfig: { thinkingLevel } } : {}),
         },
       });
 

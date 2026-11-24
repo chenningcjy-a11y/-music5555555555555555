@@ -7,7 +7,9 @@ import {
   Disc3,
   Download,
   FileAudio,
+  Film,
   Headphones,
+  Layers,
   Loader2,
   Mic2,
   Music2,
@@ -37,6 +39,7 @@ interface TaskDetailViewProps {
 
 const CATEGORY_LABELS: Record<AiTaskCategory, string> = {
   stem_separation: '人声与伴奏分离',
+  mv_export: 'MV 与舞台视频导出',
   audio_analysis: 'AI 歌曲分析',
   lyrics_assistant: 'AI 歌词处理',
   dsp_tuning: 'AI 智能调音',
@@ -92,6 +95,7 @@ export const TaskDetailView: React.FC<TaskDetailViewProps> = ({
     resumeTask,
     cancelTask,
     retryTask,
+    downloadMvExportResult,
     deleteTaskRecord,
     deleteTaskStemResult,
   } = useTaskCenter();
@@ -191,7 +195,8 @@ export const TaskDetailView: React.FC<TaskDetailViewProps> = ({
         </button>
 
         <div className="flex flex-wrap items-center gap-2">
-          {task.category === 'stem_separation' &&
+          {(task.category === 'stem_separation' ||
+            task.category === 'mv_export') &&
             (task.status === 'running' || task.status === 'queued') && (
               <button
                 type="button"
@@ -203,7 +208,9 @@ export const TaskDetailView: React.FC<TaskDetailViewProps> = ({
               </button>
             )}
 
-          {task.status === 'paused' && (
+          {(task.status === 'paused' ||
+            (task.category === 'mv_export' &&
+              task.status === 'interrupted')) && (
             <button
               type="button"
               onClick={() => void resumeTask(task.id)}
@@ -213,7 +220,9 @@ export const TaskDetailView: React.FC<TaskDetailViewProps> = ({
               }}
             >
               <Play className="w-3.5 h-3.5" fill="currentColor" />
-              <span>继续执行</span>
+              <span>
+                {task.category === 'mv_export' ? '继续导出' : '继续执行'}
+              </span>
             </button>
           )}
 
@@ -237,14 +246,28 @@ export const TaskDetailView: React.FC<TaskDetailViewProps> = ({
             <button
               type="button"
               onClick={() => void retryTask(task.id)}
-              className="min-h-[40px] px-4 py-2 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
-              style={{
-                background: `linear-gradient(135deg, ${activePalette.primary}, ${activePalette.secondary})`,
-              }}
+              className={
+                task.category === 'mv_export' && task.status === 'interrupted'
+                  ? 'min-h-[40px] px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/16 border border-white/15 text-xs font-medium text-white flex items-center gap-1.5 cursor-pointer whitespace-nowrap'
+                  : 'min-h-[40px] px-4 py-2 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer whitespace-nowrap'
+              }
+              style={
+                task.category === 'mv_export' && task.status === 'interrupted'
+                  ? undefined
+                  : {
+                      background: `linear-gradient(135deg, ${activePalette.primary}, ${activePalette.secondary})`,
+                    }
+              }
             >
               <RotateCcw className="w-3.5 h-3.5" />
               <span>
-                {task.status === 'needs_resubmit' ? '重新提交任务' : '重试任务'}
+                {task.category === 'mv_export'
+                  ? task.status === 'interrupted'
+                    ? '从头重新导出'
+                    : '重新导出'
+                  : task.status === 'needs_resubmit'
+                  ? '重新提交任务'
+                  : '重试任务'}
               </span>
             </button>
           )}
@@ -433,6 +456,125 @@ export const TaskDetailView: React.FC<TaskDetailViewProps> = ({
           </div>
         )}
       </section>
+
+      {/* MV Export Configuration, Checkpoint Status & Result Panel */}
+      {task.category === 'mv_export' && (
+        <section className="rounded-3xl bg-white/[0.045] backdrop-blur-xl border border-white/10 p-5 sm:p-6 space-y-5">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <Film className="w-5 h-5 text-rose-300 shrink-0" />
+              <div>
+                <h3 className="text-base font-semibold text-white">
+                  MV 导出参数与断点/成品管理
+                </h3>
+                <p className="text-xs text-white/55 mt-0.5">
+                  配置前瞻、中期、后期片段与分辨率参数；编码关键帧每 6 秒自动落盘持久化
+                </p>
+              </div>
+            </div>
+
+            {task.status === 'completed' && task.mvExportResult && (
+              <button
+                type="button"
+                onClick={() => void downloadMvExportResult(task.id)}
+                className="min-h-[40px] px-4 py-2 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
+                style={{
+                  background: `linear-gradient(135deg, ${activePalette.primary}, ${activePalette.secondary})`,
+                }}
+              >
+                <Download className="w-4 h-4" />
+                <span>下载导出文件</span>
+              </button>
+            )}
+          </div>
+
+          {task.mvExportConfig && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+              <div className="rounded-2xl bg-black/25 border border-white/8 p-3.5 space-y-1">
+                <span className="text-white/45 block">画质与帧率</span>
+                <span className="text-white font-mono-tabular font-semibold block">
+                  {task.mvExportConfig.quality.toUpperCase()} · {task.mvExportConfig.fps} fps
+                </span>
+              </div>
+              <div className="rounded-2xl bg-black/25 border border-white/8 p-3.5 space-y-1">
+                <span className="text-white/45 block">交付方式</span>
+                <span className="text-white font-medium block">
+                  {task.mvExportConfig.deliveryMode === 'zip-folder'
+                    ? '完整歌曲文件夹 (.zip)'
+                    : task.mvExportConfig.deliveryMode === 'local-dir'
+                    ? '写入系统本地文件夹'
+                    : '仅导出效果视频'}
+                </span>
+              </div>
+              <div className="rounded-2xl bg-black/25 border border-white/8 p-3.5 space-y-1">
+                <span className="text-white/45 block">导出片段范围</span>
+                <span className="text-white font-mono-tabular font-medium block">
+                  {task.mvExportConfig.durationMode === 'custom'
+                    ? `${formatTime(task.mvExportConfig.startOffsetSec)} 起 · ${
+                        task.mvExportConfig.clipDurationSec || 0
+                      }s`
+                    : '完整全曲'}
+                </span>
+              </div>
+              <div className="rounded-2xl bg-black/25 border border-white/8 p-3.5 space-y-1">
+                <span className="text-white/45 block">MV 剧情分段设置</span>
+                <span className="text-white font-medium flex items-center gap-1.5">
+                  <Layers className="w-3.5 h-3.5 text-sky-300 shrink-0" />
+                  <span className="truncate">
+                    {!task.mvExportConfig.includeMvInVideo
+                      ? '纯网页封面舞台'
+                      : `前瞻:${task.mvExportConfig.includeMvIntro ? '含' : '跳'} · 中期:${
+                          task.mvExportConfig.includeMvMidBreaks ? '含' : '跳'
+                        } · 后期:${task.mvExportConfig.includeMvOutro ? '含' : '跳'}`}
+                  </span>
+                </span>
+              </div>
+            </div>
+          )}
+
+          {task.hasResumableCheckpoint &&
+            (task.status === 'paused' || task.status === 'interrupted') && (
+              <div className="rounded-2xl bg-amber-500/10 border border-amber-400/25 px-4 py-3 text-xs text-amber-100 leading-relaxed">
+                已检测到本地持久化的 WebCodecs 编码关键帧断点（{task.progress}%）。点击上方「继续导出」即可从上次中断的关键帧无缝续传，无需重新渲染已完成段落。
+              </div>
+            )}
+
+          {task.status === 'completed' && task.mvExportResult && (
+            <div className="space-y-3">
+              <div className="rounded-2xl bg-emerald-500/10 border border-emerald-400/25 px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-xs text-emerald-100">
+                <span className="font-medium truncate">
+                  成品文件：{task.mvExportResult.fileName}
+                </span>
+                <span className="font-mono-tabular text-emerald-200/85 shrink-0">
+                  {task.mvExportResult.width}×{task.mvExportResult.height} ·{' '}
+                  {task.mvExportResult.fps} fps ·{' '}
+                  {formatTime(task.mvExportResult.durationSec)} ·{' '}
+                  {formatFileSize(task.mvExportResult.sizeBytes)}
+                </span>
+              </div>
+
+              {task.mvExportResult.manifestPaths &&
+                task.mvExportResult.manifestPaths.length > 0 && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                    {task.mvExportResult.manifestPaths.map((item) => (
+                      <div
+                        key={item.path}
+                        className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-black/25 border border-white/8 text-xs"
+                      >
+                        <span className="text-white/85 truncate" title={item.path}>
+                          {item.path}
+                        </span>
+                        <span className="font-mono-tabular text-white/50 shrink-0">
+                          {item.sizeText}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+            </div>
+          )}
+        </section>
+      )}
 
       {/* Stem Separation Results Panel (Decoupled from currentTrack!) */}
       {task.category === 'stem_separation' && task.status === 'completed' && (

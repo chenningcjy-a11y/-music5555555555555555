@@ -29,6 +29,7 @@ interface AiContextValue {
   openAiCenter: (tab: AiSubTab) => void;
 
   providers: AiProviderConfig[];
+  builtinGeminiAvailable: boolean;
   defaultProviderId: string | null;
   selectedProviderId: string;
   setSelectedProviderId: (id: string) => void;
@@ -67,6 +68,8 @@ interface AiContextValue {
 
 const AiContext = createContext<AiContextValue | null>(null);
 
+export const BUILTIN_GEMINI_PROVIDER_ID = '__builtin_gemini__';
+
 export const AiProvider: React.FC<{ children: React.ReactNode }> = ({
   children,
 }) => {
@@ -82,6 +85,7 @@ export const AiProvider: React.FC<{ children: React.ReactNode }> = ({
 
   const [aiSubTab, setAiSubTab] = useState<AiSubTab>('assistant');
   const [providers, setProviders] = useState<AiProviderConfig[]>([]);
+  const [builtinGeminiAvailable, setBuiltinGeminiAvailable] = useState<boolean>(false);
   const [defaultProviderId, setDefaultProviderId] = useState<string | null>(null);
   const [selectedProviderId, setSelectedProviderIdState] = useState<string>('');
   const [selectedModel, setSelectedModel] = useState<string>('');
@@ -97,13 +101,79 @@ export const AiProvider: React.FC<{ children: React.ReactNode }> = ({
     setIsLoadingProviders(true);
     try {
       const data = await fetchProviders();
-      setProviders(data.providers);
-      setDefaultProviderId(data.defaultProviderId);
+      const hasBuiltin = Boolean(data.builtinGeminiAvailable);
+      setBuiltinGeminiAvailable(hasBuiltin);
+
+      const hasAnyReadyUserProvider = data.providers.some(
+        (p) => p.enabled && p.hasKey
+      );
+      const isBuiltinDefault =
+        hasBuiltin &&
+        (data.defaultProviderId === BUILTIN_GEMINI_PROVIDER_ID ||
+          (!hasAnyReadyUserProvider && !data.defaultProviderId));
+
+      const mergedProviders: AiProviderConfig[] = hasBuiltin
+        ? [
+            {
+              id: BUILTIN_GEMINI_PROVIDER_ID,
+              name: '原生态 Google Gemini（内置免密钥）',
+              kind: 'gemini',
+              baseUrl: 'https://generativelanguage.googleapis.com',
+              model: 'gemini-4-hydrogen',
+              availableModels:
+                data.builtinGeminiModels && data.builtinGeminiModels.length > 0
+                  ? data.builtinGeminiModels
+                  : [
+                      '__builtin_auto_ensemble__',
+                      'gemini-4-hydrogen',
+                      'gemini-3.1-flash-lite',
+                      'gemini-4-argon',
+                    ],
+              maskedKey: '内置原生态服务',
+              hasKey: true,
+              enabled: true,
+              isDefault: isBuiltinDefault,
+              timeoutMs: 60000,
+              maxRequestsPerDay: 0,
+              requestsToday: 0,
+              connectionStatus: 'connected',
+              createdAt: 0,
+              updatedAt: 0,
+            },
+            ...data.providers.map((p) =>
+              isBuiltinDefault ? { ...p, isDefault: false } : p
+            ),
+          ]
+        : data.providers;
+
+      setProviders(mergedProviders);
+      setDefaultProviderId(
+        isBuiltinDefault ? BUILTIN_GEMINI_PROVIDER_ID : data.defaultProviderId
+      );
+
       setSelectedProviderIdState((prev) => {
-        if (prev && data.providers.some((p) => p.id === prev)) {
+        if (prev && mergedProviders.some((p) => p.id === prev)) {
           return prev;
         }
-        return data.defaultProviderId || data.providers[0]?.id || '';
+        if (isBuiltinDefault) {
+          return BUILTIN_GEMINI_PROVIDER_ID;
+        }
+        const defaultEntry = mergedProviders.find(
+          (p) => p.id === data.defaultProviderId
+        );
+        if (defaultEntry && defaultEntry.enabled && defaultEntry.hasKey) {
+          return defaultEntry.id;
+        }
+        const firstReadyUser = data.providers.find(
+          (p) => p.enabled && p.hasKey
+        );
+        if (firstReadyUser) {
+          return firstReadyUser.id;
+        }
+        if (hasBuiltin) {
+          return BUILTIN_GEMINI_PROVIDER_ID;
+        }
+        return data.defaultProviderId || mergedProviders[0]?.id || '';
       });
     } catch {
       // keep previous state
@@ -246,6 +316,7 @@ export const AiProvider: React.FC<{ children: React.ReactNode }> = ({
         setAiSubTab,
         openAiCenter,
         providers,
+        builtinGeminiAvailable,
         defaultProviderId,
         selectedProviderId,
         setSelectedProviderId,

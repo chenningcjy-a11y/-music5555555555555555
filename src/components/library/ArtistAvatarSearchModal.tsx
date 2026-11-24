@@ -1,9 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Check,
   Download,
   ImagePlus,
   Loader2,
+  Maximize2,
+  Minimize2,
   Search,
   UserRound,
   X,
@@ -46,6 +49,7 @@ export const ArtistAvatarSearchModal: React.FC<ArtistAvatarSearchModalProps> = (
   const [failedPreviewUrls, setFailedPreviewUrls] = useState<Set<string>>(
     () => new Set()
   );
+  const [isFullscreenModal, setIsFullscreenModal] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -150,13 +154,19 @@ export const ArtistAvatarSearchModal: React.FC<ArtistAvatarSearchModalProps> = (
     `${artistName} portrait`,
   ];
 
-  return (
+  return createPortal(
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-md p-4"
+      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-md ${
+        isFullscreenModal ? 'p-0' : 'p-2 sm:p-4'
+      }`}
       onClick={onClose}
     >
       <div
-        className="w-full max-w-2xl max-h-[88dvh] flex flex-col rounded-3xl bg-[#160710]/95 border border-white/15 shadow-2xl overflow-hidden"
+        className={`flex flex-col bg-[#160710]/97 shadow-2xl overflow-hidden transition-all ${
+          isFullscreenModal
+            ? 'w-screen h-[100dvh] rounded-none border-0'
+            : 'w-[96vw] max-w-5xl h-[90dvh] rounded-3xl border border-white/15'
+        }`}
         onClick={(e) => e.stopPropagation()}
       >
         <input
@@ -195,14 +205,31 @@ export const ArtistAvatarSearchModal: React.FC<ArtistAvatarSearchModalProps> = (
             </div>
           </div>
 
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="关闭搜索引擎弹窗"
-            className="p-2 rounded-xl text-white/55 hover:text-white hover:bg-white/10 transition-colors cursor-pointer shrink-0"
-          >
-            <X className="w-4 h-4" />
-          </button>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => setIsFullscreenModal((v) => !v)}
+              title={isFullscreenModal ? '还原窗口' : '全屏显示'}
+              className="p-2 rounded-xl text-white/60 hover:text-white hover:bg-white/10 transition-colors cursor-pointer flex items-center gap-1.5 text-xs"
+            >
+              {isFullscreenModal ? (
+                <Minimize2 className="w-4 h-4" />
+              ) : (
+                <Maximize2 className="w-4 h-4" />
+              )}
+              <span className="hidden sm:inline">
+                {isFullscreenModal ? '退出全屏' : '全屏'}
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="关闭搜索引擎弹窗"
+              className="p-2 rounded-xl text-white/55 hover:text-white hover:bg-white/10 transition-colors cursor-pointer shrink-0"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
         </div>
 
         {/* Search Toolbar */}
@@ -282,7 +309,7 @@ export const ArtistAvatarSearchModal: React.FC<ArtistAvatarSearchModalProps> = (
               <p className="text-xs">暂无搜索结果，可修改上方搜索词重试或上传本地头像</p>
             </div>
           ) : (
-            <div className="grid grid-cols-3 sm:grid-cols-4 gap-3">
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">
               {candidates.map((cand) => {
                 const isSelected = currentRecord?.sourceUrl === cand.url;
                 const isDownloading = downloadingUrl === cand.url;
@@ -378,6 +405,7 @@ export const ArtistAvatarSearchModal: React.FC<ArtistAvatarSearchModalProps> = (
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 };

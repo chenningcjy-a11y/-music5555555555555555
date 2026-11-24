@@ -1,6 +1,7 @@
 import express, { Router } from 'express';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import {
+  BUILTIN_GEMINI_PROVIDER_ID,
   clearProviderKey,
   deleteProvider,
   deleteStemService,
@@ -15,10 +16,13 @@ import {
   upsertStemService,
 } from './keyVault.ts';
 import {
+  BUILTIN_GEMINI_MODEL_IDS,
+  buildVirtualBuiltinGeminiProvider,
   callProviderTextCompletion,
   extractJsonFromLlmText,
   fetchModelsFromProvider,
   inferModelCapabilities,
+  resolveEffectiveProviderWithKey,
   testProviderConnection,
 } from './providerClient.ts';
 
@@ -169,21 +173,11 @@ export function createAiRouter(): Router {
   router.get('/providers', async (_req, res) => {
     try {
       const data = await listPublicProviders();
+      const hasBuiltinGemini = Boolean(process.env.GEMINI_API_KEY?.trim());
       res.json({
         ...data,
-        builtinGeminiAvailable: Boolean(process.env.GEMINI_API_KEY),
-        builtinGeminiModels: process.env.GEMINI_API_KEY
-          ? [
-              '__builtin_auto_ensemble__',
-              'gemini-3.1-flash-lite::minimal',
-              'gemini-3.1-flash-lite::medium',
-              'gemini-3.1-flash-lite::high',
-              'gemini-4-hydrogen::low',
-              'gemini-4-hydrogen::medium',
-              'gemini-4-hydrogen::high',
-              'gemini-4-hydrogen::xhigh',
-            ]
-          : [],
+        builtinGeminiAvailable: hasBuiltinGemini,
+        builtinGeminiModels: hasBuiltinGemini ? BUILTIN_GEMINI_MODEL_IDS : [],
         securityMode: 'backend-encrypted-proxy',
       });
     } catch (err) {
@@ -257,6 +251,22 @@ export function createAiRouter(): Router {
   router.post('/providers/:id/test', async (req, res) => {
     try {
       const result = await testProviderConnection(req.params.id);
+      if (req.params.id === BUILTIN_GEMINI_PROVIDER_ID) {
+        const v = buildVirtualBuiltinGeminiProvider();
+        const list = await listPublicProviders();
+        res.json({
+          ...result,
+          provider: {
+            ...v,
+            connectionStatus: result.ok ? 'connected' : 'error',
+            lastLatencyMs: result.latencyMs,
+            lastError: result.error,
+            lastCheckedAt: Date.now(),
+            isDefault: list.defaultProviderId === BUILTIN_GEMINI_PROVIDER_ID,
+          },
+        });
+        return;
+      }
       const list = await listPublicProviders();
       const updated = list.providers.find((p) => p.id === req.params.id);
       res.json({ ...result, provider: updated });
@@ -400,11 +410,9 @@ export function createAiRouter(): Router {
         durationSec,
       } = req.body || {};
 
-      const resolved = await getStoredProviderWithKey(providerId);
-      if (!resolved) {
-        res.status(400).json({
-          error: '尚未配置可用 AI 服务商，请先前往「API 服务管理」添加并启用服务商及 API Key。',
-        });
+      const resolved = await resolveEffectiveProviderWithKey(providerId);
+      if (!resolved.ok) {
+        res.status(400).json({ error: resolved.error });
         return;
       }
 
@@ -611,11 +619,9 @@ Return JSON: {"isTimedLrc": boolean, "hasWordSync": boolean, "issues": string[],
         return;
       }
 
-      const resolved = await getStoredProviderWithKey(providerId);
-      if (!resolved) {
-        res.status(400).json({
-          error: '尚未配置可用 AI 服务商，请先前往「API 服务管理」配置并启用 API Key。',
-        });
+      const resolved = await resolveEffectiveProviderWithKey(providerId);
+      if (!resolved.ok) {
+        res.status(400).json({ error: resolved.error });
         return;
       }
 
@@ -707,11 +713,9 @@ CRITICAL HONESTY RULES:
         hasAudioClip,
       } = req.body || {};
 
-      const resolved = await getStoredProviderWithKey(providerId);
-      if (!resolved) {
-        res.status(400).json({
-          error: '尚未配置可用 AI 服务商，请先前往「API 服务管理」配置服务商与 API Key。',
-        });
+      const resolved = await resolveEffectiveProviderWithKey(providerId);
+      if (!resolved.ok) {
+        res.status(400).json({ error: resolved.error });
         return;
       }
 
@@ -809,7 +813,7 @@ Return strictly valid JSON in Simplified Chinese:
         return;
       }
 
-      const resolved = await getStoredProviderWithKey(providerId);
+      const resolved = await resolveEffectiveProviderWithKey(providerId);
       const stemData = await listPublicStemServices();
       const activeStem = stemData.services.find(
         (s) => s.id === stemData.activeStemServiceId
@@ -821,13 +825,8 @@ Return strictly valid JSON in Simplified Chinese:
           (activeStem.kind === 'builtin-mdx' || Boolean(activeStem.baseUrl))
       );
 
-      if (!resolved || !resolved.apiKey || !resolved.provider.enabled) {
-        // Even if no LLM key is configured, check if it's clearly a stem-separation request?
-        // No—prompt requires checking configured AI services honestly:
-        res.status(400).json({
-          error:
-            '当前默认 AI 服务商未启用或尚未填写 API Key。请前往「设置 → AI 智能中心 → API 服务管理」配置并测试连接。',
-        });
+      if (!resolved.ok) {
+        res.status(400).json({ error: resolved.error });
         return;
       }
 

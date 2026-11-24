@@ -257,14 +257,7 @@ export function supportsDirectoryPicker(): boolean {
   );
 }
 
-/**
- * Writes package entries straight into a real local directory on desktop Chromium browsers
- * supporting the File System Access API (`showDirectoryPicker`).
- */
-export async function saveEntriesToPickedFolder(
-  rootFolderName: string,
-  entries: ZipPackageEntry[]
-): Promise<{ folderName: string; fileCount: number }> {
+export async function pickDirectoryHandle(): Promise<FileSystemDirectoryHandle> {
   const picker = (
     window as unknown as {
       showDirectoryPicker?: (opts?: { mode?: 'read' | 'readwrite' }) => Promise<FileSystemDirectoryHandle>;
@@ -273,13 +266,20 @@ export async function saveEntriesToPickedFolder(
   if (!picker) {
     throw new Error('当前浏览器不支持直接写入系统文件夹，请使用 ZIP 歌曲包一键下载。');
   }
+  return picker({ mode: 'readwrite' });
+}
 
-  const baseDir = await picker({ mode: 'readwrite' });
-  const songDir = await baseDir.getDirectoryHandle(sanitizeFileName(rootFolderName), {
+export async function saveEntriesToDirectoryHandle(
+  baseDir: FileSystemDirectoryHandle,
+  rootFolderName: string,
+  entries: ZipPackageEntry[]
+): Promise<{ folderName: string; fileCount: number }> {
+  const safeRoot = sanitizeFileName(rootFolderName);
+  const songDir = await baseDir.getDirectoryHandle(safeRoot, {
     create: true,
   });
 
-  const cleanPrefix = `${sanitizeFileName(rootFolderName)}/`;
+  const cleanPrefix = `${safeRoot}/`;
   let fileCount = 0;
 
   for (const entry of entries) {
@@ -312,5 +312,17 @@ export async function saveEntriesToPickedFolder(
     fileCount++;
   }
 
-  return { folderName: sanitizeFileName(rootFolderName), fileCount };
+  return { folderName: safeRoot, fileCount };
+}
+
+/**
+ * Writes package entries straight into a real local directory on desktop Chromium browsers
+ * supporting the File System Access API (`showDirectoryPicker`).
+ */
+export async function saveEntriesToPickedFolder(
+  rootFolderName: string,
+  entries: ZipPackageEntry[]
+): Promise<{ folderName: string; fileCount: number }> {
+  const baseDir = await pickDirectoryHandle();
+  return saveEntriesToDirectoryHandle(baseDir, rootFolderName, entries);
 }

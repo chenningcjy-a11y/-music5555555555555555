@@ -1,4 +1,9 @@
-import { AiTaskRecord } from '../types/ai';
+import {
+  AiTaskRecord,
+  MvExportCheckpointMeta,
+  MvExportChunkBatch,
+  MvExportResultRecord,
+} from '../types/ai';
 import {
   ArtistAvatarRecord,
   AudioDspSettings,
@@ -20,7 +25,7 @@ import {
 } from '../utils/constants';
 
 const DB_NAME = 'lumina-music-db';
-const DB_VERSION = 6;
+const DB_VERSION = 7;
 
 const STORE_TRACKS = 'tracks';
 const STORE_BLOBS = 'audioBlobs';
@@ -32,6 +37,9 @@ const STORE_AI_TASKS = 'ai_tasks';
 const STORE_MVS = 'mvs';
 const STORE_MV_BLOBS = 'mvBlobs';
 const STORE_ARTIST_AVATARS = 'artistAvatars';
+const STORE_MV_EXPORT_CHECKPOINTS = 'mvExportCheckpoints';
+const STORE_MV_EXPORT_CHUNKS = 'mvExportChunks';
+const STORE_MV_EXPORT_RESULTS = 'mvExportResults';
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -73,6 +81,18 @@ function openDatabase(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_ARTIST_AVATARS)) {
         db.createObjectStore(STORE_ARTIST_AVATARS, { keyPath: 'artistKey' });
+      }
+      if (!db.objectStoreNames.contains(STORE_MV_EXPORT_CHECKPOINTS)) {
+        db.createObjectStore(STORE_MV_EXPORT_CHECKPOINTS, { keyPath: 'taskId' });
+      }
+      if (!db.objectStoreNames.contains(STORE_MV_EXPORT_CHUNKS)) {
+        const chunkStore = db.createObjectStore(STORE_MV_EXPORT_CHUNKS, {
+          keyPath: 'id',
+        });
+        chunkStore.createIndex('by_taskId', 'taskId', { unique: false });
+      }
+      if (!db.objectStoreNames.contains(STORE_MV_EXPORT_RESULTS)) {
+        db.createObjectStore(STORE_MV_EXPORT_RESULTS, { keyPath: 'taskId' });
       }
     };
 
@@ -485,6 +505,8 @@ export async function saveAiTask(task: AiTaskRecord): Promise<void> {
 
 export async function deleteAiTaskById(taskId: string): Promise<void> {
   try {
+    await clearMvExportCheckpoint(taskId);
+    await deleteMvExportResult(taskId);
     const db = await openDatabase();
     const tx = db.transaction(STORE_AI_TASKS, 'readwrite');
     await wrapRequest(tx.objectStore(STORE_AI_TASKS).delete(taskId));
@@ -495,8 +517,23 @@ export async function deleteAiTaskById(taskId: string): Promise<void> {
 
 export async function clearAiTasks(): Promise<void> {
   const db = await openDatabase();
-  const tx = db.transaction(STORE_AI_TASKS, 'readwrite');
-  await wrapRequest(tx.objectStore(STORE_AI_TASKS).clear());
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(
+      [
+        STORE_AI_TASKS,
+        STORE_MV_EXPORT_CHECKPOINTS,
+        STORE_MV_EXPORT_CHUNKS,
+        STORE_MV_EXPORT_RESULTS,
+      ],
+      'readwrite'
+    );
+    tx.objectStore(STORE_AI_TASKS).clear();
+    tx.objectStore(STORE_MV_EXPORT_CHECKPOINTS).clear();
+    tx.objectStore(STORE_MV_EXPORT_CHUNKS).clear();
+    tx.objectStore(STORE_MV_EXPORT_RESULTS).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
 }
 
 export async function getAllStemRecords(): Promise<TrackStemsRecord[]> {
@@ -1003,5 +1040,139 @@ export async function deleteArtistAvatar(artistKey: string): Promise<void> {
   }
 }
 
+// ---------- MV Export Resumable Checkpoints & Download Results ----------
 
+export async function saveMvExportCheckpoint(
+  meta: MvExportCheckpointMeta,
+  newBatch: MvExportChunkBatch | null
+): Promise<void> {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const stores = newBatch
+      ? [STORE_MV_EXPORT_CHECKPOINTS, STORE_MV_EXPORT_CHUNKS]
+      : [STORE_MV_EXPORT_CHECKPOINTS];
+    const tx = db.transaction(stores, 'readwrite');
+    tx.objectStore(STORE_MV_EXPORT_CHECKPOINTS).put(meta);
+    if (newBatch) {
+      tx.objectStore(STORE_MV_EXPORT_CHUNKS).put(newBatch);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => {
+      const err = tx.error;
+      if (err && err.name === 'QuotaExceededError') {
+        reject(new Error('浏览器存储空间不足，无法继续保存断点缓存'));
+      } else {
+        reject(err || new Error('保存导出断点失败'));
+      }
+    };
+  });
+}
 
+export async function getMvExportCheckpointMeta(
+  taskId: string
+): Promise<MvExportCheckpointMeta | undefined> {
+  try {
+    const db = await openDatabase();
+    const tx = db.transaction(STORE_MV_EXPORT_CHECKPOINTS, 'readonly');
+    return (await wrapRequest(
+      tx.objectStore(STORE_MV_EXPORT_CHECKPOINTS).get(taskId)
+    )) as MvExportCheckpointMeta | undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function loadMvExportCheckpoint(taskId: string): Promise<{
+  meta: MvExportCheckpointMeta;
+  batches: MvExportChunkBatch[];
+} | null> {
+  try {
+    const db = await openDatabase();
+    const metaTx = db.transaction(STORE_MV_EXPORT_CHECKPOINTS, 'readonly');
+    const meta = (await wrapRequest(
+      metaTx.objectStore(STORE_MV_EXPORT_CHECKPOINTS).get(taskId)
+    )) as MvExportCheckpointMeta | undefined;
+    if (!meta) return null;
+
+    const chunksTx = db.transaction(STORE_MV_EXPORT_CHUNKS, 'readonly');
+    const store = chunksTx.objectStore(STORE_MV_EXPORT_CHUNKS);
+    let batches: MvExportChunkBatch[];
+    if (store.indexNames.contains('by_taskId')) {
+      batches = (await wrapRequest(
+        store.index('by_taskId').getAll(taskId)
+      )) as MvExportChunkBatch[];
+    } else {
+      const all = (await wrapRequest(store.getAll())) as MvExportChunkBatch[];
+      batches = all.filter((b) => b.taskId === taskId);
+    }
+    batches.sort((a, b) => a.batchIndex - b.batchIndex);
+    return { meta, batches };
+  } catch {
+    return null;
+  }
+}
+
+export async function clearMvExportCheckpoint(taskId: string): Promise<void> {
+  try {
+    const db = await openDatabase();
+    const readTx = db.transaction(STORE_MV_EXPORT_CHUNKS, 'readonly');
+    const chunkStore = readTx.objectStore(STORE_MV_EXPORT_CHUNKS);
+    const chunkKeys = chunkStore.indexNames.contains('by_taskId')
+      ? ((await wrapRequest(
+          chunkStore.index('by_taskId').getAllKeys(taskId)
+        )) as IDBValidKey[])
+      : ((await wrapRequest(chunkStore.getAll())) as MvExportChunkBatch[])
+          .filter((b) => b.taskId === taskId)
+          .map((b) => b.id);
+
+    await new Promise<void>((resolve) => {
+      const tx = db.transaction(
+        [STORE_MV_EXPORT_CHECKPOINTS, STORE_MV_EXPORT_CHUNKS],
+        'readwrite'
+      );
+      tx.objectStore(STORE_MV_EXPORT_CHECKPOINTS).delete(taskId);
+      const delStore = tx.objectStore(STORE_MV_EXPORT_CHUNKS);
+      for (const k of chunkKeys) {
+        delStore.delete(k);
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  } catch {
+    // Non-fatal
+  }
+}
+
+export async function saveMvExportResult(record: MvExportResultRecord): Promise<void> {
+  try {
+    const db = await openDatabase();
+    const tx = db.transaction(STORE_MV_EXPORT_RESULTS, 'readwrite');
+    await wrapRequest(tx.objectStore(STORE_MV_EXPORT_RESULTS).put(record));
+  } catch {
+    // Non-fatal if very large finished file exceeds quota; browser already triggers download directly
+  }
+}
+
+export async function getMvExportResult(
+  taskId: string
+): Promise<MvExportResultRecord | undefined> {
+  try {
+    const db = await openDatabase();
+    const tx = db.transaction(STORE_MV_EXPORT_RESULTS, 'readonly');
+    return (await wrapRequest(
+      tx.objectStore(STORE_MV_EXPORT_RESULTS).get(taskId)
+    )) as MvExportResultRecord | undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function deleteMvExportResult(taskId: string): Promise<void> {
+  try {
+    const db = await openDatabase();
+    const tx = db.transaction(STORE_MV_EXPORT_RESULTS, 'readwrite');
+    await wrapRequest(tx.objectStore(STORE_MV_EXPORT_RESULTS).delete(taskId));
+  } catch {
+    // Non-fatal
+  }
+}
